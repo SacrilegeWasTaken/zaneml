@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="Resources/zaneml-512.png" alt="zaneml" width="220" />
+  <img src="resources/zaneml-512.png" alt="zaneml" width="512" />
 </p>
 
 <h1 align="center">zaneml</h1>
