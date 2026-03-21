@@ -33,6 +33,12 @@ pub const Embedding  = @import("embedding.zig").Embedding;
 pub const MomentBuf  = @import("optimizer_state.zig").MomentBuf;
 
 /// Tape-based automatic differentiation
-pub const Tape          = @import("autograd.zig").Tape;
+pub const Tape           = @import("autograd.zig").Tape;
 pub const AutogradTensor = @import("autograd.zig").Tensor;
+
+/// Two-layer MLP trained via tape-based autograd (plug-in for Network)
+pub const TapeMLP = @import("tape_mlp.zig").TapeMLP;
+
+/// Backend optimizer dispatch — use in custom models that implement updateWeights.
+pub const OptimizerImpl = @import("backend.zig").OptimizerImpl;
 
