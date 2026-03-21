@@ -1,5 +1,6 @@
 const std = @import("std");
 const Activation = @import("../activation.zig").Activation;
+const __e = @import("../vulkan/engine.zig");
 
 pub const VulkanBackend = struct {
     pub fn forward(

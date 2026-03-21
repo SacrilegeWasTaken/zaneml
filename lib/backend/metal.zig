@@ -1,5 +1,6 @@
 const std = @import("std");
 const Activation = @import("../activation.zig").Activation;
+const __e = @import("../metal/engine.zig");
 
 pub const MetalBackend = struct {
     pub fn forward(

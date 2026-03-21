@@ -1,5 +1,6 @@
 const std = @import("std");
 const Activation = @import("../activation.zig").Activation;
+const __e = @import("../cuda/engine.zig");
 
 pub const CudaBackend = struct {
     pub fn forward(
