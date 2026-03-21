@@ -115,6 +115,17 @@ pub fn Tape(comptime backend: Backend) type {
         pub fn backward(self: *Self, loss: *Tensor) void {
             std.debug.assert(loss.data.len == 1);
             loss.grad[0] = 1.0;
+            self.replayBackward();
+        }
+
+        /// Replay ops in reverse using whatever grad is already set on `out`.
+        /// Use this when upstream gradients come from an external loss (e.g. Network).
+        pub fn backwardFrom(self: *Self, out: *Tensor) void {
+            _ = out; // grad already written by caller
+            self.replayBackward();
+        }
+
+        fn replayBackward(self: *Self) void {
             var i = self.ops.items.len;
             while (i > 0) {
                 i -= 1;
