@@ -1,0 +1,5 @@
+.zig-cache
+flake.lock
+.DS_Store
+.claude
+zig-out
