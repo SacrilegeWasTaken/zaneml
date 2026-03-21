@@ -52,6 +52,22 @@ pub fn build(b: *std.Build) void {
     const run_perceptron_step = b.step("perceptron", "Run examples/perceptron.zig");
     run_perceptron_step.dependOn(&run_perceptron_cmd.step);
 
+    const transformer_exe = b.addExecutable(.{
+        .name = "transformer",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("examples/transformer.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = example_imports,
+        }),
+    });
+
+    const run_transformer_cmd = b.addRunArtifact(transformer_exe);
+    if (b.args) |args| run_transformer_cmd.addArgs(args);
+
+    const run_transformer_step = b.step("transformer", "Run examples/transformer.zig");
+    run_transformer_step.dependOn(&run_transformer_cmd.step);
+
     const mod_tests = b.addTest(.{
         .root_module = mod,
     });

@@ -15,17 +15,17 @@ pub const CpuBackend = struct {
         out: []f32,
         activation: Activation,
     ) void {
-        // z = W*x + b  →  pre_activation_out
+        // z = W*x + b  ->  pre_activation_out
         matmulSimd(pre_activation_out, weights, input, out.len, input.len);
         for (pre_activation_out, biases) |*z, b| z.* += b;
-        // a = activation(z)  →  out
+        // a = activation(z)  ->  out
         for (out, pre_activation_out) |*o, z| o.* = applyActivation(activation, z);
     }
 
-    // grad_out  — gradient from top
-    // grad_in   — gradient going bottom
-    // grad_w    — gradient weight for updates
-    // grad_b    — gradient bias
+    // grad_out  -- gradient from top
+    // grad_in   -- gradient going bottom
+    // grad_w    -- gradient weight for updates
+    // grad_b    -- gradient bias
     pub fn backward(
         allocator: std.mem.Allocator,
         weights: []const f32,
@@ -40,7 +40,6 @@ pub const CpuBackend = struct {
     ) !void {
         _ = biases;
 
-        // аллоцируем delta нормально
         const delta = try allocator.alloc(f32, pre_activation.len);
         defer allocator.free(delta);
 
@@ -49,7 +48,7 @@ pub const CpuBackend = struct {
             di.* = go * applyActivationBackward(activation, pre);
         }
 
-        // grad_w = delta * input^T — тоже через SIMD
+        // grad_w = delta * input^T
         for (0..delta.len) |i| {
             const dv: VecF32 = @splat(delta[i]);
             var j: usize = 0;
@@ -72,7 +71,7 @@ pub const CpuBackend = struct {
         // grad_in = weights^T * delta
         matmulTransposedSimd(grad_in, weights, delta, input.len, delta.len);
     }
- };
+};
 
 
 pub fn applyActivation(activation: Activation, x: f32) f32 {
@@ -83,6 +82,8 @@ pub fn applyActivation(activation: Activation, x: f32) f32 {
         .linear       => x,
         .leaky_relu   => |alpha| if (x > 0) x else alpha * x,
         .elu          => |alpha| if (x > 0) x else alpha * (@exp(x) - 1.0),
+        .gelu         => geluForward(x),
+        .silu         => siluForward(x),
     };
 }
 
@@ -101,7 +102,38 @@ pub fn applyActivationBackward(activation: Activation, x: f32) f32 {
         .linear       => 1.0,
         .leaky_relu   => |alpha| if (x > 0) 1.0 else alpha,
         .elu          => |alpha| if (x > 0) 1.0 else alpha * @exp(x),
+        .gelu         => geluBackward(x),
+        .silu         => siluBackward(x),
     };
+}
+
+/// GELU forward: x * 0.5 * (1 + tanh(sqrt(2/pi) * (x + 0.044715*x^3)))
+fn geluForward(x: f32) f32 {
+    const sqrt_2_over_pi: f32 = @sqrt(2.0 / std.math.pi);
+    const inner = sqrt_2_over_pi * (x + 0.044715 * x * x * x);
+    return x * 0.5 * (1.0 + std.math.tanh(inner));
+}
+
+/// GELU backward (approximate derivative)
+fn geluBackward(x: f32) f32 {
+    const sqrt_2_over_pi: f32 = @sqrt(2.0 / std.math.pi);
+    const inner = sqrt_2_over_pi * (x + 0.044715 * x * x * x);
+    const tanh_val = std.math.tanh(inner);
+    return 0.5 * tanh_val
+        + 0.5
+        + x * 0.5 * (1.0 - tanh_val * tanh_val) * sqrt_2_over_pi * (1.0 + 3.0 * 0.044715 * x * x);
+}
+
+/// SiLU forward: x * sigmoid(x)
+fn siluForward(x: f32) f32 {
+    const s = 1.0 / (1.0 + @exp(-x));
+    return x * s;
+}
+
+/// SiLU backward: sigmoid(x) * (1 + x * (1 - sigmoid(x)))
+fn siluBackward(x: f32) f32 {
+    const s = 1.0 / (1.0 + @exp(-x));
+    return s * (1.0 + x * (1.0 - s));
 }
 
 
@@ -165,4 +197,269 @@ fn matmulSimd(
 }
 
 
+pub const CpuLayerNorm = struct {
+    pub fn forward(
+        input: []const f32,
+        out: []f32,
+        gamma: []const f32,
+        beta: []const f32,
+        eps: f32,
+        x_norm_out: []f32,
+        mean_out: *f32,
+        rstd_out: *f32,
+    ) void {
+        const dim = input.len;
+        var mean: f32 = 0;
+        for (input) |x| mean += x;
+        mean /= @as(f32, @floatFromInt(dim));
 
+        var variance: f32 = 0;
+        for (input) |x| { const d = x - mean; variance += d * d; }
+        variance /= @as(f32, @floatFromInt(dim));
+
+        const rstd = 1.0 / @sqrt(variance + eps);
+        mean_out.* = mean;
+        rstd_out.* = rstd;
+
+        for (input, out, x_norm_out, gamma, beta) |x, *o, *xn, g, b| {
+            xn.* = (x - mean) * rstd;
+            o.* = xn.* * g + b;
+        }
+    }
+
+    pub fn backward(
+        grad_out: []const f32,
+        grad_in: []f32,
+        grad_gamma: []f32,
+        grad_beta: []f32,
+        x_norm: []const f32,
+        gamma: []const f32,
+        rstd: f32,
+    ) void {
+        const dim = grad_out.len;
+        for (grad_out, x_norm, grad_gamma, grad_beta) |go, xn, *gg, *gb| {
+            gg.* += go * xn;
+            gb.* += go;
+        }
+        var sum1: f32 = 0;
+        var sum2: f32 = 0;
+        for (grad_out, x_norm, gamma) |go, xn, g| {
+            sum1 += go * g;
+            sum2 += go * g * xn;
+        }
+        const inv_dim = rstd / @as(f32, @floatFromInt(dim));
+        for (grad_in, grad_out, x_norm, gamma) |*gi, go, xn, g| {
+            gi.* = inv_dim * (@as(f32, @floatFromInt(dim)) * go * g - sum1 - xn * sum2);
+        }
+    }
+};
+
+
+pub const CpuAttention = struct {
+    /// Forward pass for multi-head attention.
+    /// When causal=true, applies causal mask (upper-triangular -1e9) before softmax.
+    pub fn forward(
+        comptime d_model: usize,
+        comptime n_heads: usize,
+        comptime d_head: usize,
+        comptime max_seq: usize,
+        attn_scale: f32,
+        seq: usize,
+        input: []const f32,
+        output: []f32,
+        wq_f: []const f32,
+        wk_f: []const f32,
+        wv_f: []const f32,
+        wo_f: []const f32,
+        cache_q: []f32,
+        cache_k: []f32,
+        cache_v: []f32,
+        cache_attn: []f32,
+        cache_concat: []f32,
+        scratch: []f32,
+        causal: bool,
+    ) void {
+        _ = max_seq;
+
+        const mm = struct {
+            fn call(out: []f32, a: []const f32, b: []const f32, m: usize, k: usize, n: usize) void {
+                for (0..m) |i| {
+                    for (0..n) |j| {
+                        var s: f32 = 0;
+                        for (0..k) |l| s += a[i * k + l] * b[l * n + j];
+                        out[i * n + j] = s;
+                    }
+                }
+            }
+        }.call;
+
+        const softmaxRow = struct {
+            fn call(row: []f32) void {
+                var max: f32 = row[0];
+                for (row) |v| if (v > max) { max = v; };
+                var sum: f32 = 0;
+                for (row) |*v| { v.* = @exp(v.* - max); sum += v.*; }
+                for (row) |*v| v.* /= sum;
+            }
+        }.call;
+
+        mm(cache_q[0 .. seq * d_model], input, wq_f, seq, d_model, d_model);
+        mm(cache_k[0 .. seq * d_model], input, wk_f, seq, d_model, d_model);
+        mm(cache_v[0 .. seq * d_model], input, wv_f, seq, d_model, d_model);
+
+        @memset(cache_concat[0 .. seq * d_model], 0);
+
+        for (0..n_heads) |h| {
+            const ho = h * d_head;
+            const ao = h * seq * seq;
+            for (0..seq) |i| {
+                for (0..seq) |j| {
+                    var dot: f32 = 0;
+                    for (0..d_head) |dk| {
+                        dot += cache_q[i * d_model + ho + dk] * cache_k[j * d_model + ho + dk];
+                    }
+                    scratch[i * seq + j] = dot * attn_scale;
+                }
+                // Apply causal mask: set future positions to -1e9
+                if (causal) {
+                    for (0..seq) |j| {
+                        if (j > i) scratch[i * seq + j] = -1e9;
+                    }
+                }
+                softmaxRow(scratch[i * seq .. (i + 1) * seq]);
+                @memcpy(cache_attn[ao + i * seq .. ao + (i + 1) * seq], scratch[i * seq .. (i + 1) * seq]);
+            }
+            for (0..seq) |i| {
+                for (0..d_head) |dk| {
+                    var s: f32 = 0;
+                    for (0..seq) |j| s += cache_attn[ao + i * seq + j] * cache_v[j * d_model + ho + dk];
+                    cache_concat[i * d_model + ho + dk] = s;
+                }
+            }
+        }
+        mm(output[0 .. seq * d_model], cache_concat[0 .. seq * d_model], wo_f, seq, d_model, d_model);
+    }
+
+    pub fn backward(
+        comptime d_model: usize,
+        comptime n_heads: usize,
+        comptime d_head: usize,
+        attn_scale: f32,
+        seq: usize,
+        input: []const f32,
+        grad_out: []const f32,
+        grad_in: []f32,
+        wq_f: []const f32,
+        wk_f: []const f32,
+        wv_f: []const f32,
+        wo_f: []const f32,
+        cache_q: []const f32,
+        cache_k: []const f32,
+        cache_v: []const f32,
+        cache_attn: []const f32,
+        cache_concat: []const f32,
+        grad_wq: []f32,
+        grad_wk: []f32,
+        grad_wv: []f32,
+        grad_wo: []f32,
+        grad_q: []f32,
+        grad_k: []f32,
+        grad_v: []f32,
+        grad_concat: []f32,
+        scratch: []f32,
+    ) void {
+        const sm = seq * d_model;
+
+        // grad_wo += concat^T @ grad_out
+        @memset(grad_concat[0..sm], 0);
+        for (0..d_model) |i| {
+            for (0..d_model) |j| {
+                var s: f32 = 0;
+                for (0..seq) |t| s += cache_concat[t * d_model + i] * grad_out[t * d_model + j];
+                grad_wo[i * d_model + j] += s;
+            }
+        }
+        // grad_concat = grad_out @ W_o^T
+        for (0..seq) |t| {
+            for (0..d_model) |i| {
+                var s: f32 = 0;
+                for (0..d_model) |j| s += grad_out[t * d_model + j] * wo_f[i * d_model + j];
+                grad_concat[t * d_model + i] = s;
+            }
+        }
+
+        @memset(grad_q[0..sm], 0);
+        @memset(grad_k[0..sm], 0);
+        @memset(grad_v[0..sm], 0);
+
+        for (0..n_heads) |h| {
+            const ho = h * d_head;
+            const ao = h * seq * seq;
+
+            for (0..seq) |j| {
+                for (0..d_head) |dk| {
+                    var s: f32 = 0;
+                    for (0..seq) |i| s += cache_attn[ao + i * seq + j] * grad_concat[i * d_model + ho + dk];
+                    grad_v[j * d_model + ho + dk] += s;
+                }
+            }
+
+            // grad_attn into scratch
+            for (0..seq) |i| {
+                for (0..seq) |j| {
+                    var s: f32 = 0;
+                    for (0..d_head) |dk| s += grad_concat[i * d_model + ho + dk] * cache_v[j * d_model + ho + dk];
+                    scratch[i * seq + j] = s;
+                }
+            }
+
+            // softmax backward
+            for (0..seq) |i| {
+                var dot: f32 = 0;
+                for (0..seq) |j| dot += scratch[i * seq + j] * cache_attn[ao + i * seq + j];
+                for (0..seq) |j| {
+                    scratch[i * seq + j] = cache_attn[ao + i * seq + j] * (scratch[i * seq + j] - dot);
+                }
+            }
+
+            for (0..seq) |i| {
+                for (0..d_head) |dk| {
+                    var s: f32 = 0;
+                    for (0..seq) |j| s += scratch[i * seq + j] * cache_k[j * d_model + ho + dk];
+                    grad_q[i * d_model + ho + dk] += s * attn_scale;
+                }
+            }
+            for (0..seq) |j| {
+                for (0..d_head) |dk| {
+                    var s: f32 = 0;
+                    for (0..seq) |i| s += scratch[i * seq + j] * cache_q[i * d_model + ho + dk];
+                    grad_k[j * d_model + ho + dk] += s * attn_scale;
+                }
+            }
+        }
+
+        @memset(grad_in[0..sm], 0);
+        // grad_wq += input^T @ grad_q, grad_in += grad_q @ W_q^T  (and same for K, V)
+        const projs = [3]struct { gw: []f32, w: []const f32, gp: []f32 }{
+            .{ .gw = grad_wq, .w = wq_f, .gp = grad_q },
+            .{ .gw = grad_wk, .w = wk_f, .gp = grad_k },
+            .{ .gw = grad_wv, .w = wv_f, .gp = grad_v },
+        };
+        for (projs) |p| {
+            for (0..d_model) |i| {
+                for (0..d_model) |j| {
+                    var s: f32 = 0;
+                    for (0..seq) |t| s += input[t * d_model + i] * p.gp[t * d_model + j];
+                    p.gw[i * d_model + j] += s;
+                }
+            }
+            for (0..seq) |t| {
+                for (0..d_model) |i| {
+                    var s: f32 = 0;
+                    for (0..d_model) |j| s += p.gp[t * d_model + j] * p.w[i * d_model + j];
+                    grad_in[t * d_model + i] += s;
+                }
+            }
+        }
+    }
+};

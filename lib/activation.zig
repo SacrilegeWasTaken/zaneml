@@ -7,4 +7,8 @@ pub const Activation = union(enum) {
     sigmoid,
     tanh,
     linear,
+    /// Gaussian Error Linear Unit (tanh approximation)
+    gelu,
+    /// Sigmoid Linear Unit: x * sigmoid(x)
+    silu,
 };
