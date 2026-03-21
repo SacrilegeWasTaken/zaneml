@@ -5,7 +5,7 @@ const zaneml = @import("zaneml");
 
 const L   = zaneml.Layer(.cpu);
 const Seq = zaneml.Sequential(struct { fc1: L, fc2: L });
-const Net = zaneml.Network(*Seq);
+const Net = zaneml.Network(.cpu, *Seq);
 
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};

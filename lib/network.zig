@@ -1,4 +1,6 @@
 const std = @import("std");
+const backend_mod   = @import("backend.zig");
+pub const Backend   = backend_mod.Backend;
 const optimizer_mod = @import("optimizer.zig");
 pub const Optimizer = optimizer_mod.Optimizer;
 
@@ -49,6 +51,7 @@ pub const TrainConfig = struct {
 
 /// Generic wrapper over any module.
 ///
+/// `backend` selects which backend implementation to use for loss and optimizer compute.
 /// `Model` must be a pointer to a type implementing:
 ///   pub fn forward      (self, input: []const f32, output: []f32) void
 ///   pub fn backward     (self, input: []const f32, grad_out: []const f32, grad_in: []f32) [!]void
@@ -58,11 +61,13 @@ pub const TrainConfig = struct {
 ///   pub fn gradNormSq(self: *const Self) f32
 ///   pub fn scaleGrads(self: *Self, s: f32) void
 /// These are used for gradient clipping if grad_clip > 0.
-pub fn Network(comptime Model: type) type {
+pub fn Network(comptime backend: Backend, comptime Model: type) type {
     comptime {
         if (@typeInfo(Model) != .pointer)
-            @compileError("Network: Model must be a pointer, e.g. Network(*MyModel)");
+            @compileError("Network: Model must be a pointer, e.g. Network(.cpu, *MyModel)");
     }
+    const LossImpl = backend_mod.LossImpl(backend);
+
     return struct {
         model:     Model,
         allocator: std.mem.Allocator,
@@ -121,29 +126,11 @@ pub fn Network(comptime Model: type) type {
 
                     self.model.forward(s.input, output);
 
-                    // Compute loss and gradient
-                    switch (config.loss) {
-                        .mse => {
-                            for (grad_out, output, s.target) |*g, o, tgt| {
-                                const d = o - tgt;
-                                total_loss += d * d;
-                                g.* = 2.0 * d * inv;
-                            }
-                        },
-                        .cross_entropy => {
-                            // Softmax(output) -> grad_out
-                            var max_val: f32 = output[0];
-                            for (output) |v| if (v > max_val) { max_val = v; };
-                            var sum_exp: f32 = 0;
-                            for (output) |v| sum_exp += @exp(v - max_val);
-                            for (grad_out, output, s.target) |*g, o, tgt| {
-                                const soft = @exp(o - max_val) / sum_exp;
-                                g.* = (soft - tgt) * inv;
-                                // Cross-entropy loss: -sum(target * log(softmax))
-                                if (tgt > 0) total_loss -= tgt * @log(soft + 1e-9);
-                            }
-                        },
-                    }
+                    // Compute loss and gradient via backend
+                    total_loss += switch (config.loss) {
+                        .mse           => LossImpl.mse(output, s.target, grad_out, inv),
+                        .cross_entropy => LossImpl.cross_entropy(output, s.target, grad_out, inv),
+                    };
 
                     try callBackward(self.model, s.input, grad_out, grad_in);
 

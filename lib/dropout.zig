@@ -1,11 +1,14 @@
 const std = @import("std");
-const optimizer_mod = @import("optimizer.zig");
-const Optimizer = optimizer_mod.Optimizer;
+const backend_mod = @import("backend.zig");
+const Backend = backend_mod.Backend;
+const Optimizer = @import("optimizer.zig").Optimizer;
 
 /// Inverted dropout: during training scales kept activations by 1/(1-rate).
 /// Stores binary mask for backward pass.
 /// Set training=false at inference time.
-pub fn Dropout(comptime max_size: usize, comptime rate: f32) type {
+pub fn Dropout(comptime backend: Backend, comptime max_size: usize, comptime rate: f32) type {
+    const Impl = backend_mod.DropoutImpl(backend);
+
     return struct {
         mask:     [max_size]bool,
         training: bool,
@@ -24,24 +27,13 @@ pub fn Dropout(comptime max_size: usize, comptime rate: f32) type {
 
         /// Forward pass. If not training or rate==0, copies input unchanged.
         pub fn forward(self: *Self, input: []const f32, output: []f32) void {
-            if (!self.training or rate == 0.0) {
-                @memcpy(output[0..input.len], input);
-                return;
-            }
-            const scale = 1.0 / (1.0 - rate);
-            for (input, output[0..input.len], self.mask[0..input.len]) |x, *o, *keep| {
-                keep.* = self.rng.random().float(f32) >= rate;
-                o.* = if (keep.*) x * scale else 0;
-            }
+            Impl.forward(input, output, &self.mask, rate, self.training, &self.rng);
         }
 
         /// Backward pass: propagates gradient through the saved mask.
         pub fn backward(self: *Self, input: []const f32, grad_out: []const f32, grad_in: []f32) void {
             _ = input;
-            const scale = 1.0 / (1.0 - rate);
-            for (grad_in, grad_out, self.mask[0..grad_out.len]) |*gi, go, keep| {
-                gi.* = if (keep) go * scale else 0;
-            }
+            Impl.backward(grad_out, grad_in, &self.mask, rate);
         }
 
         /// No-op: Dropout has no learnable parameters.

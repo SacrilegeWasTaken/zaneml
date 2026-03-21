@@ -27,7 +27,7 @@ pub fn TransformerStack(
 ) type {
     comptime std.debug.assert(n_layers >= 1);
     const Block = BlockFn(backend, d_model, n_heads, d_ff, max_seq, cfg);
-    const PE    = PEFn(d_model, max_seq);
+    const PE    = PEFn(backend, d_model, max_seq);
 
     return struct {
         pos_embed: PE,

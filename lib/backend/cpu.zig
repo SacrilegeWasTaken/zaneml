@@ -463,3 +463,180 @@ pub const CpuAttention = struct {
         }
     }
 };
+
+
+pub const CpuOptimizer = struct {
+    /// In-place parameter update. Zeroes grads after update.
+    /// m/v may be empty slices for SGD (ignored).
+    pub fn update(
+        opt: @import("../optimizer.zig").Optimizer,
+        t: usize,
+        lr: f32,
+        params: []f32,
+        grads: []f32,
+        m: []f32,
+        v: []f32,
+    ) void {
+        switch (opt.kind) {
+            .sgd => {
+                for (params, grads) |*p, g| p.* -= lr * g;
+            },
+            .adam => |cfg| {
+                const b1 = cfg.beta1;
+                const b2 = cfg.beta2;
+                const eps = cfg.eps;
+                const t_f: f32 = @floatFromInt(t);
+                const bc1 = 1.0 - std.math.pow(f32, b1, t_f);
+                const bc2 = 1.0 - std.math.pow(f32, b2, t_f);
+                for (params, grads, m, v) |*p, g, *mi, *vi| {
+                    mi.* = b1 * mi.* + (1.0 - b1) * g;
+                    vi.* = b2 * vi.* + (1.0 - b2) * g * g;
+                    const m_hat = mi.* / bc1;
+                    const v_hat = vi.* / bc2;
+                    p.* -= lr * m_hat / (@sqrt(v_hat) + eps);
+                }
+            },
+            .adamw => |cfg| {
+                const b1 = cfg.beta1;
+                const b2 = cfg.beta2;
+                const eps = cfg.eps;
+                const wd  = cfg.weight_decay;
+                const t_f: f32 = @floatFromInt(t);
+                const bc1 = 1.0 - std.math.pow(f32, b1, t_f);
+                const bc2 = 1.0 - std.math.pow(f32, b2, t_f);
+                for (params, grads, m, v) |*p, g, *mi, *vi| {
+                    mi.* = b1 * mi.* + (1.0 - b1) * g;
+                    vi.* = b2 * vi.* + (1.0 - b2) * g * g;
+                    const m_hat = mi.* / bc1;
+                    const v_hat = vi.* / bc2;
+                    p.* = p.* * (1.0 - lr * wd) - lr * m_hat / (@sqrt(v_hat) + eps);
+                }
+            },
+        }
+        @memset(grads, 0);
+    }
+};
+
+pub const CpuLoss = struct {
+    /// MSE: returns raw loss sum, fills grad_out with normalized gradient.
+    pub fn mse(output: []const f32, target: []const f32, grad_out: []f32, inv: f32) f32 {
+        var loss: f32 = 0;
+        for (grad_out, output, target) |*g, o, tgt| {
+            const d = o - tgt;
+            loss += d * d;
+            g.* = 2.0 * d * inv;
+        }
+        return loss;
+    }
+
+    /// Cross-entropy with softmax: returns raw loss sum, fills grad_out.
+    pub fn cross_entropy(output: []const f32, target: []const f32, grad_out: []f32, inv: f32) f32 {
+        var max_val: f32 = output[0];
+        for (output) |v| if (v > max_val) { max_val = v; };
+        var sum_exp: f32 = 0;
+        for (output) |v| sum_exp += @exp(v - max_val);
+        var loss: f32 = 0;
+        for (grad_out, output, target) |*g, o, tgt| {
+            const soft = @exp(o - max_val) / sum_exp;
+            g.* = (soft - tgt) * inv;
+            if (tgt > 0) loss -= tgt * @log(soft + 1e-9);
+        }
+        return loss;
+    }
+};
+
+pub const CpuRMSNorm = struct {
+    pub fn forward(
+        input: []const f32,
+        out: []f32,
+        gamma: []const f32,
+        eps: f32,
+        x_norm_out: []f32,
+        rstd_out: *f32,
+    ) void {
+        const dim = input.len;
+        var mean_sq: f32 = 0;
+        for (input) |x| mean_sq += x * x;
+        mean_sq /= @as(f32, @floatFromInt(dim));
+        const rms = @sqrt(mean_sq + eps);
+        rstd_out.* = rms;
+        for (input, out, x_norm_out, gamma) |x, *o, *xn, g| {
+            xn.* = x / rms;
+            o.* = g * xn.*;
+        }
+    }
+
+    pub fn backward(
+        grad_out: []const f32,
+        grad_in: []f32,
+        grad_gamma: []f32,
+        x_norm: []const f32,
+        gamma: []const f32,
+        rstd: f32,
+    ) void {
+        const dim = grad_out.len;
+        for (grad_out, x_norm, grad_gamma) |go, xn, *gg| gg.* += go * xn;
+        var dot: f32 = 0;
+        for (grad_out, x_norm, gamma) |go, xn, g| dot += go * xn * g;
+        dot /= @as(f32, @floatFromInt(dim));
+        const inv_rms = 1.0 / rstd;
+        for (grad_in, grad_out, x_norm, gamma) |*gi, go, xn, g| {
+            gi.* = inv_rms * (g * go - xn * dot);
+        }
+    }
+};
+
+pub const CpuPositionalEmbedding = struct {
+    pub fn forward(input: []const f32, output: []f32, embed: []const f32) void {
+        for (output, input, embed) |*o, x, pe| o.* = x + pe;
+    }
+
+    pub fn backward(grad_out: []const f32, grad_in: []f32, grad_embed: []f32) void {
+        for (grad_in, grad_out) |*gi, go| gi.* = go;
+        for (grad_embed, grad_out) |*ge, go| ge.* += go;
+    }
+};
+
+pub const CpuEmbedding = struct {
+    pub fn forward(d_model: usize, indices: []const u32, output: []f32, table: []const f32) void {
+        for (indices, 0..) |idx, i| {
+            @memcpy(output[i * d_model .. (i + 1) * d_model], table[idx * d_model .. (idx + 1) * d_model]);
+        }
+    }
+
+    pub fn backward(d_model: usize, indices: []const u32, grad_out: []const f32, grad_table: []f32) void {
+        for (indices, 0..) |idx, i| {
+            const src = grad_out[i * d_model .. (i + 1) * d_model];
+            const dst = grad_table[idx * d_model .. (idx + 1) * d_model];
+            for (dst, src) |*gd, gr| gd.* += gr;
+        }
+    }
+};
+
+pub const CpuDropout = struct {
+    pub fn forward(
+        input: []const f32,
+        output: []f32,
+        mask: []bool,
+        rate: f32,
+        training: bool,
+        rng: *std.Random.DefaultPrng,
+    ) void {
+        if (!training or rate == 0.0) {
+            @memcpy(output[0..input.len], input);
+            return;
+        }
+        const scale = 1.0 / (1.0 - rate);
+        for (input, output[0..input.len], mask[0..input.len]) |x, *o, *keep| {
+            keep.* = rng.random().float(f32) >= rate;
+            o.* = if (keep.*) x * scale else 0;
+        }
+    }
+
+    pub fn backward(grad_out: []const f32, grad_in: []f32, mask: []const bool, rate: f32) void {
+        const scale = 1.0 / (1.0 - rate);
+        for (grad_in, grad_out, mask[0..grad_out.len]) |*gi, go, keep| {
+            gi.* = if (keep) go * scale else 0;
+        }
+    }
+};

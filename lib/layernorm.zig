@@ -30,8 +30,9 @@ pub fn LayerNorm(comptime backend: Backend, comptime dim: usize) type {
         last_mean: f32,
         last_rstd: f32,        // 1 / sqrt(var + eps)
 
-        const Self = @This();
-        const Impl = backend_mod.LayerNormImpl(backend);
+        const Self    = @This();
+        const Impl    = backend_mod.LayerNormImpl(backend);
+        const OptImpl = backend_mod.OptimizerImpl(backend);
 
         /// Initialize LayerNorm with given epsilon. gamma=1, beta=0.
         pub fn init(eps: f32) Self {
@@ -68,8 +69,8 @@ pub fn LayerNorm(comptime backend: Backend, comptime dim: usize) type {
 
         /// Update gamma and beta using the given optimizer. t is the 1-based step counter.
         pub fn updateWeights(self: *Self, opt: Optimizer, lr: f32, t: usize) void {
-            opt.update(t, lr, &self.gamma, &self.grad_gamma, &self.m_gamma, &self.v_gamma);
-            opt.update(t, lr, &self.beta,  &self.grad_beta,  &self.m_beta,  &self.v_beta);
+            OptImpl.update(opt, t, lr, &self.gamma, &self.grad_gamma, &self.m_gamma, &self.v_gamma);
+            OptImpl.update(opt, t, lr, &self.beta,  &self.grad_beta,  &self.m_beta,  &self.v_beta);
         }
 
         /// Returns the sum of squared gradients.

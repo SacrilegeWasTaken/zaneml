@@ -1,6 +1,7 @@
 const std = @import("std");
-const optimizer_mod = @import("optimizer.zig");
-const Optimizer = optimizer_mod.Optimizer;
+const backend_mod = @import("backend.zig");
+const Backend = backend_mod.Backend;
+const Optimizer = @import("optimizer.zig").Optimizer;
 
 /// Learnable positional embeddings.
 ///
@@ -9,7 +10,10 @@ const Optimizer = optimizer_mod.Optimizer;
 ///           grad_in[t]     = grad_out[t]
 ///
 /// Size: max_seq x d_model parameters stored as struct fields (not heap).
-pub fn PositionalEmbedding(comptime d_model: usize, comptime max_seq: usize) type {
+pub fn PositionalEmbedding(comptime backend: Backend, comptime d_model: usize, comptime max_seq: usize) type {
+    const Impl    = backend_mod.PositionalEmbeddingImpl(backend);
+    const OptImpl = backend_mod.OptimizerImpl(backend);
+
     return struct {
         embed:      [max_seq * d_model]f32,
         grad_embed: [max_seq * d_model]f32,
@@ -34,19 +38,18 @@ pub fn PositionalEmbedding(comptime d_model: usize, comptime max_seq: usize) typ
 
         /// Forward pass: input/output are [seq * d_model]; seq is inferred from input.len.
         pub fn forward(self: *Self, input: []const f32, output: []f32) void {
-            for (output, input, self.embed[0..input.len]) |*o, x, pe| o.* = x + pe;
+            Impl.forward(input, output, self.embed[0..input.len]);
         }
 
         /// Backward pass: passes gradient through (identity) and accumulates grad_embed.
         pub fn backward(self: *Self, input: []const f32, grad_out: []const f32, grad_in: []f32) void {
             _ = input;
-            for (grad_in, grad_out) |*gi, go| gi.* = go;
-            for (self.grad_embed[0..grad_out.len], grad_out) |*ge, go| ge.* += go;
+            Impl.backward(grad_out, grad_in, self.grad_embed[0..grad_out.len]);
         }
 
         /// Update embeddings using the given optimizer. t is the 1-based step counter.
         pub fn updateWeights(self: *Self, opt: Optimizer, lr: f32, t: usize) void {
-            opt.update(t, lr, &self.embed, &self.grad_embed, &self.m_embed, &self.v_embed);
+            OptImpl.update(opt, t, lr, &self.embed, &self.grad_embed, &self.m_embed, &self.v_embed);
         }
 
         /// Returns the sum of squared gradients.

@@ -24,8 +24,9 @@ pub fn Layer(comptime backend: __b.Backend) type {
         activation: Activation,
         allocator: std.mem.Allocator,
 
-        const Self = @This();
-        const Impl = __b.BackendImpl(backend);
+        const Self    = @This();
+        const Impl    = __b.BackendImpl(backend);
+        const OptImpl = __b.OptimizerImpl(backend);
 
         pub const Config = struct {
             n_in: usize,
@@ -141,8 +142,8 @@ pub fn Layer(comptime backend: __b.Backend) type {
             // Convert f16 weights to f32 for update
             for (self.weights, self.weights_compute_buffer) |w, *wf| wf.* = @floatCast(w);
 
-            opt.update(t, lr, self.weights_compute_buffer, self.grad_w, self.m_w, self.v_w);
-            opt.update(t, lr, self.biases, self.grad_b, self.m_b, self.v_b);
+            OptImpl.update(opt, t, lr, self.weights_compute_buffer, self.grad_w, self.m_w, self.v_w);
+            OptImpl.update(opt, t, lr, self.biases, self.grad_b, self.m_b, self.v_b);
 
             // Sync f32 -> f16
             for (self.weights, self.weights_compute_buffer) |*w, wf| w.* = @floatCast(wf);

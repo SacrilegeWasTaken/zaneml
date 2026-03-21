@@ -77,8 +77,9 @@ pub fn MultiHeadAttention(
 
         last_seq: usize,
 
-        const Self = @This();
-        const Impl = backend_mod.AttentionImpl(backend);
+        const Self    = @This();
+        const Impl    = backend_mod.AttentionImpl(backend);
+        const OptImpl = backend_mod.OptimizerImpl(backend);
 
         // ── init / deinit ───────────────────────────────────────────────
 
@@ -166,10 +167,10 @@ pub fn MultiHeadAttention(
             for (self.wv, &self.wv_f) |w, *wf| wf.* = @floatCast(w);
             for (self.wo, &self.wo_f) |w, *wf| wf.* = @floatCast(w);
 
-            opt.update(t, lr, &self.wq_f, &self.grad_wq, &self.m_wq, &self.v_wq);
-            opt.update(t, lr, &self.wk_f, &self.grad_wk, &self.m_wk, &self.v_wk);
-            opt.update(t, lr, &self.wv_f, &self.grad_wv, &self.m_wv, &self.v_wv);
-            opt.update(t, lr, &self.wo_f, &self.grad_wo, &self.m_wo, &self.v_wo);
+            OptImpl.update(opt, t, lr, &self.wq_f, &self.grad_wq, &self.m_wq, &self.v_wq);
+            OptImpl.update(opt, t, lr, &self.wk_f, &self.grad_wk, &self.m_wk, &self.v_wk);
+            OptImpl.update(opt, t, lr, &self.wv_f, &self.grad_wv, &self.m_wv, &self.v_wv);
+            OptImpl.update(opt, t, lr, &self.wo_f, &self.grad_wo, &self.m_wo, &self.v_wo);
 
             // Sync f32 -> f16
             for (&self.wq, self.wq_f) |*w, wf| w.* = @floatCast(wf);
