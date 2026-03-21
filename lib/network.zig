@@ -47,6 +47,7 @@ pub const TrainConfig = struct {
     grad_clip:   f32,
     lr_schedule: LRSchedule,
     loss:        Loss,
+    batch_size:  usize,
 };
 
 /// Generic wrapper over any module.
@@ -118,21 +119,31 @@ pub fn Network(comptime backend: Backend, comptime Model: type) type {
             for (0..config.epochs) |epoch| {
                 var total_loss: f32 = 0;
 
-                for (samples) |s| {
-                    t += 1;
+                var si: usize = 0;
+                while (si < samples.len) : (si += config.batch_size) {
+                    const batch_end = @min(si + config.batch_size, samples.len);
+                    const batch     = samples[si..batch_end];
+                    const bs: f32   = @floatFromInt(batch_end - si);
 
-                    // Compute effective lr for this step
+                    t += 1;
                     const lr = config.lr_schedule.get(config.lr, t);
 
-                    self.model.forward(s.input, output);
+                    // Accumulate gradients over the batch
+                    for (batch) |s| {
+                        self.model.forward(s.input, output);
+                        total_loss += switch (config.loss) {
+                            .mse           => LossImpl.mse(output, s.target, grad_out, inv),
+                            .cross_entropy => LossImpl.cross_entropy(output, s.target, grad_out, inv),
+                        };
+                        try callBackward(self.model, s.input, grad_out, grad_in);
+                    }
 
-                    // Compute loss and gradient via backend
-                    total_loss += switch (config.loss) {
-                        .mse           => LossImpl.mse(output, s.target, grad_out, inv),
-                        .cross_entropy => LossImpl.cross_entropy(output, s.target, grad_out, inv),
-                    };
-
-                    try callBackward(self.model, s.input, grad_out, grad_in);
+                    // Average gradients over batch
+                    if (batch.len > 1) {
+                        if (comptime @hasDecl(ModelBase, "scaleGrads")) {
+                            self.model.scaleGrads(1.0 / bs);
+                        }
+                    }
 
                     // Gradient clipping (global norm)
                     if (config.grad_clip > 0) {
@@ -156,6 +167,23 @@ pub fn Network(comptime backend: Backend, comptime Model: type) type {
             }
         }
     };
+}
+
+// ── unit tests ────────────────────────────────────────────────────────────────
+
+const testing = std.testing;
+
+test "LRSchedule: constant always returns base_lr" {
+    const sched: LRSchedule = .constant;
+    try testing.expectApproxEqAbs(@as(f32, 0.01), sched.get(0.01,    0), 1e-7);
+    try testing.expectApproxEqAbs(@as(f32, 0.01), sched.get(0.01, 1000), 1e-7);
+}
+
+test "LRSchedule: warmup_cosine linearly ramps during warmup" {
+    const sched: LRSchedule = .{ .warmup_cosine = .{ .warmup = 10, .total = 100 } };
+    try testing.expectApproxEqAbs(@as(f32, 0.0), sched.get(1.0, 0), 1e-6); // step 0 → 0
+    try testing.expectApproxEqAbs(@as(f32, 0.5), sched.get(1.0, 5), 1e-6); // halfway → 0.5
+    try testing.expectApproxEqAbs(@as(f32, 1.0), sched.get(1.0, 10), 1e-6); // end of warmup → 1
 }
 
 /// Comptime-safe backward call: handles both void and !void return types.

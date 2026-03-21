@@ -110,3 +110,13 @@ pub fn DropoutImpl(comptime backend: Backend) type {
         .cuda   => cuda_b.CudaDropout,
     };
 }
+
+pub fn MatmulImpl(comptime backend: Backend) type {
+    return switch (backend) {
+        .cpu    => cpu_b.CpuMatmul,
+        .metal  => metal_b.MetalMatmul,
+        .ane    => ane_b.AneMatmul,
+        .vulkan => vulkan_b.VulkanMatmul,
+        .cuda   => cuda_b.CudaMatmul,
+    };
+}

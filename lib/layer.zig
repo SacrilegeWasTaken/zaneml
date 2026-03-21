@@ -164,3 +164,53 @@ pub fn Layer(comptime backend: __b.Backend) type {
         }
     };
 }
+
+// ── unit tests ────────────────────────────────────────────────────────────────
+
+const testing = std.testing;
+const L = Layer(.cpu);
+
+fn approxEq(actual: f32, expected: f32, tol: f32) !void {
+    if (@abs(actual - expected) > tol) {
+        std.debug.print("expected ~{d}, got {d}\n", .{ expected, actual });
+        return error.TestExpectedApproxEqual;
+    }
+}
+
+test "layer: forward with known weight matrix (linear)" {
+    // Weights [[2,0],[0,3]] × input [5,7] + bias [0,0] = [10, 21]
+    const alloc = testing.allocator;
+    var layer = try L.init(alloc, .{ .n_in = 2, .n_out = 2, .activation = .linear });
+    defer layer.deinit();
+    layer.weights[0] = @floatCast(@as(f32, 2.0));
+    layer.weights[1] = @floatCast(@as(f32, 0.0));
+    layer.weights[2] = @floatCast(@as(f32, 0.0));
+    layer.weights[3] = @floatCast(@as(f32, 3.0));
+    @memset(layer.biases, 0.0);
+    var out = [_]f32{ 0, 0 };
+    layer.forward(&.{ 5.0, 7.0 }, &out);
+    try approxEq(out[0], 10.0, 1e-4);
+    try approxEq(out[1], 21.0, 1e-4);
+}
+
+test "layer: bias is added to output" {
+    const alloc = testing.allocator;
+    var layer = try L.init(alloc, .{ .n_in = 1, .n_out = 1, .activation = .linear });
+    defer layer.deinit();
+    layer.weights[0] = @floatCast(@as(f32, 1.0));
+    layer.biases[0]  = 4.0;
+    var out = [_]f32{0};
+    layer.forward(&.{3.0}, &out);
+    try approxEq(out[0], 7.0, 1e-4); // 1*3 + 4
+}
+
+test "layer: relu activation clamps negative pre-activation" {
+    const alloc = testing.allocator;
+    var layer = try L.init(alloc, .{ .n_in = 1, .n_out = 1, .activation = .relu });
+    defer layer.deinit();
+    layer.weights[0] = @floatCast(@as(f32, -1.0));
+    @memset(layer.biases, 0.0);
+    var out = [_]f32{0};
+    layer.forward(&.{2.0}, &out); // pre-act = -2 → relu → 0
+    try approxEq(out[0], 0.0, 1e-5);
+}

@@ -69,6 +69,7 @@ pub fn main() !void {
         .grad_clip   = 1.0,
         .lr_schedule = .constant,
         .loss        = .mse,
+        .batch_size  = 1,
     });
 
     var output = [_]f32{0} ** (SEQ * D_MODEL);

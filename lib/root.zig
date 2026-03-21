@@ -31,3 +31,8 @@ pub const Embedding  = @import("embedding.zig").Embedding;
 
 /// Fixed-size Adam moment buffer helper
 pub const MomentBuf  = @import("optimizer_state.zig").MomentBuf;
+
+/// Tape-based automatic differentiation
+pub const Tape          = @import("autograd.zig").Tape;
+pub const AutogradTensor = @import("autograd.zig").Tensor;
+

@@ -640,3 +640,87 @@ pub const CpuDropout = struct {
         }
     }
 };
+
+pub const CpuMatmul = struct {
+    /// out[m*n] = a[m*k] @ b[k*n]  (overwrites out)
+    pub fn forward(a: []const f32, b: []const f32, out: []f32, m: usize, k: usize, n: usize) void {
+        for (0..m) |i| {
+            for (0..n) |j| {
+                var s: f32 = 0;
+                for (0..k) |l| s += a[i * k + l] * b[l * n + j];
+                out[i * n + j] = s;
+            }
+        }
+    }
+
+    /// grad_a += grad_out @ b^T:  grad_a[m*k] += grad_out[m*n] @ b[k*n]^T
+    pub fn backwardA(grad_out: []const f32, b: []const f32, grad_a: []f32, m: usize, k: usize, n: usize) void {
+        for (0..m) |i| {
+            for (0..k) |l| {
+                var s: f32 = 0;
+                for (0..n) |j| s += grad_out[i * n + j] * b[l * n + j];
+                grad_a[i * k + l] += s;
+            }
+        }
+    }
+
+    /// grad_b += a^T @ grad_out:  grad_b[k*n] += a[m*k]^T @ grad_out[m*n]
+    pub fn backwardB(a: []const f32, grad_out: []const f32, grad_b: []f32, m: usize, k: usize, n: usize) void {
+        for (0..k) |l| {
+            for (0..n) |j| {
+                var s: f32 = 0;
+                for (0..m) |i| s += a[i * k + l] * grad_out[i * n + j];
+                grad_b[l * n + j] += s;
+            }
+        }
+    }
+};
+
+// ── unit tests ────────────────────────────────────────────────────────────────
+
+const testing = std.testing;
+const Optimizer = @import("../optimizer.zig").Optimizer;
+
+fn approxEq(actual: f32, expected: f32, tol: f32) !void {
+    if (@abs(actual - expected) > tol) {
+        std.debug.print("expected ~{d}, got {d}\n", .{ expected, actual });
+        return error.TestExpectedApproxEqual;
+    }
+}
+
+test "CpuOptimizer: SGD param -= lr * grad, grads zeroed after" {
+    const opt = Optimizer{ .kind = .sgd };
+    var params = [_]f32{ 1.0, 2.0 };
+    var grads  = [_]f32{ 0.1, 0.2 };
+    var m      = [_]f32{ 0.0, 0.0 };
+    var v      = [_]f32{ 0.0, 0.0 };
+    CpuOptimizer.update(opt, 1, 0.1, &params, &grads, &m, &v);
+    try approxEq(params[0], 0.99, 1e-6);
+    try approxEq(params[1], 1.98, 1e-6);
+    try approxEq(grads[0], 0.0, 1e-9);
+    try approxEq(grads[1], 0.0, 1e-9);
+}
+
+test "CpuOptimizer: Adam first step close to -lr" {
+    // After step 1 with grad=1: m_hat=1, v_hat=1 → update ≈ lr
+    const opt = Optimizer{ .kind = .{ .adam = .{ .beta1 = 0.9, .beta2 = 0.999, .eps = 1e-8 } } };
+    var params = [_]f32{ 0.0 };
+    var grads  = [_]f32{ 1.0 };
+    var m      = [_]f32{ 0.0 };
+    var v      = [_]f32{ 0.0 };
+    CpuOptimizer.update(opt, 1, 0.01, &params, &grads, &m, &v);
+    try approxEq(params[0], -0.01, 1e-4);
+}
+
+test "CpuOptimizer: AdamW shrinks weight even with zero gradient" {
+    // param *= (1 - lr*wd) = 2.0 * 0.999 = 1.998
+    const opt = Optimizer{ .kind = .{ .adamw = .{
+        .beta1 = 0.9, .beta2 = 0.999, .eps = 1e-8, .weight_decay = 0.1,
+    } } };
+    var params = [_]f32{ 2.0 };
+    var grads  = [_]f32{ 0.0 };
+    var m      = [_]f32{ 0.0 };
+    var v      = [_]f32{ 0.0 };
+    CpuOptimizer.update(opt, 1, 0.01, &params, &grads, &m, &v);
+    try approxEq(params[0], 2.0 * (1.0 - 0.01 * 0.1), 1e-4);
+}

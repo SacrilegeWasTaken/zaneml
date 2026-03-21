@@ -71,6 +71,21 @@ pub const MetalLoss = struct {
     }
 };
 
+pub const MetalMatmul = struct {
+    pub fn forward(a: []const f32, b: []const f32, out: []f32, m: usize, k: usize, n: usize) void {
+        _ = .{ a, b, out, m, k, n };
+        @panic("Metal Matmul not implemented yet");
+    }
+    pub fn backwardA(grad_out: []const f32, b: []const f32, grad_a: []f32, m: usize, k: usize, n: usize) void {
+        _ = .{ grad_out, b, grad_a, m, k, n };
+        @panic("Metal Matmul not implemented yet");
+    }
+    pub fn backwardB(a: []const f32, grad_out: []const f32, grad_b: []f32, m: usize, k: usize, n: usize) void {
+        _ = .{ a, grad_out, grad_b, m, k, n };
+        @panic("Metal Matmul not implemented yet");
+    }
+};
+
 pub const MetalRMSNorm = struct {
     pub fn forward(
         input: []const f32, out: []f32, gamma: []const f32,

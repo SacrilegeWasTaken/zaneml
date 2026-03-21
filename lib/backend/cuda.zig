@@ -124,6 +124,21 @@ pub const CudaDropout = struct {
     }
 };
 
+pub const CudaMatmul = struct {
+    pub fn forward(a: []const f32, b: []const f32, out: []f32, m: usize, k: usize, n: usize) void {
+        _ = .{ a, b, out, m, k, n };
+        @panic("CUDA Matmul not implemented yet");
+    }
+    pub fn backwardA(grad_out: []const f32, b: []const f32, grad_a: []f32, m: usize, k: usize, n: usize) void {
+        _ = .{ grad_out, b, grad_a, m, k, n };
+        @panic("CUDA Matmul not implemented yet");
+    }
+    pub fn backwardB(a: []const f32, grad_out: []const f32, grad_b: []f32, m: usize, k: usize, n: usize) void {
+        _ = .{ a, grad_out, grad_b, m, k, n };
+        @panic("CUDA Matmul not implemented yet");
+    }
+};
+
 pub const CudaAttention = struct {
     pub fn forward(
         comptime d_model: usize, comptime n_heads: usize, comptime d_head: usize, comptime max_seq: usize,

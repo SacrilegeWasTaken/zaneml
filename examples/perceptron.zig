@@ -35,6 +35,7 @@ pub fn main() !void {
         .grad_clip   = 0,
         .lr_schedule = .constant,
         .loss        = .mse,
+        .batch_size  = 4,
     });
 
     std.debug.print("\n--- predictions ---\n", .{});

@@ -68,11 +68,46 @@ pub fn build(b: *std.Build) void {
     const run_transformer_step = b.step("transformer", "Run examples/transformer.zig");
     run_transformer_step.dependOn(&run_transformer_cmd.step);
 
-    const mod_tests = b.addTest(.{
+    const autograd_exe = b.addExecutable(.{
+        .name = "autograd",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("examples/autograd_xor.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = example_imports,
+        }),
+    });
+
+    const run_autograd_cmd = b.addRunArtifact(autograd_exe);
+    if (b.args) |args| run_autograd_cmd.addArgs(args);
+
+    const run_autograd_step = b.step("autograd", "Run examples/autograd_xor.zig (XOR via Tape API)");
+    run_autograd_step.dependOn(&run_autograd_cmd.step);
+
+    // Unit tests — discovered transitively from lib/root.zig
+    const unit_tests = b.addTest(.{
         .root_module = mod,
     });
-    const run_mod_tests = b.addRunArtifact(mod_tests);
+    const run_unit_tests = b.addRunArtifact(unit_tests);
 
-    const test_step = b.step("test", "Run library tests");
-    test_step.dependOn(&run_mod_tests.step);
+    // Integration tests — tests/ directory, imports zaneml as a dependency
+    const integration_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/integration.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = example_imports,
+        }),
+    });
+    const run_integration_tests = b.addRunArtifact(integration_tests);
+
+    const test_step = b.step("test", "Run all tests (unit + integration)");
+    test_step.dependOn(&run_unit_tests.step);
+    test_step.dependOn(&run_integration_tests.step);
+
+    const unit_test_step = b.step("test-unit", "Run unit tests only (inline in lib/)");
+    unit_test_step.dependOn(&run_unit_tests.step);
+
+    const integration_test_step = b.step("test-integration", "Run integration tests only (tests/)");
+    integration_test_step.dependOn(&run_integration_tests.step);
 }
