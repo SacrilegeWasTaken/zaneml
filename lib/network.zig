@@ -109,6 +109,13 @@ pub fn Network(comptime Model: type) type {
             const out_size = samples[0].target.len;
             const in_size  = samples[0].input.len;
 
+            // Metal batch path: stack a full batch into one forward/backward pass.
+            // Requires the model to expose batchForward/batchBackward (TransformerStack on Metal).
+            if (comptime backend_ == .metal and @hasDecl(ModelBase, "batchForward")) {
+                try self.trainBatched(samples, config, in_size, out_size);
+                return;
+            }
+
             const output   = try self.allocator.alloc(f32, out_size);
             defer self.allocator.free(output);
             const grad_out = try self.allocator.alloc(f32, out_size);
@@ -163,6 +170,94 @@ pub fn Network(comptime Model: type) type {
                     }
 
                     self.model.updateWeights(config.optimizer, lr, t);
+                }
+
+                if (config.log_every > 0 and (epoch + 1) % config.log_every == 0) {
+                    const n: f32 = @floatFromInt(samples.len * out_size);
+                    std.log.info("epoch {d:>6}  loss = {d:.6}", .{ epoch + 1, total_loss / n });
+                }
+            }
+        }
+
+        /// Metal batch training: stacks each batch into one forward+backward pass,
+        /// reducing command buffer overhead from (2*batch_size + 1) to 3 per step.
+        fn trainBatched(self: *Self, samples: []const Sample, config: TrainConfig, in_size: usize, out_size: usize) !void {
+            // Global step counter for Adam bias correction (1-based)
+            var t: usize = 0;
+
+            var si: usize = 0;
+            // Allocate stacked buffers for the largest batch
+            const max_bs = @min(config.batch_size, samples.len);
+            const stacked_input  = try self.allocator.alloc(f32, max_bs * in_size);
+            defer self.allocator.free(stacked_input);
+            const stacked_output = try self.allocator.alloc(f32, max_bs * out_size);
+            defer self.allocator.free(stacked_output);
+            const stacked_target = try self.allocator.alloc(f32, max_bs * out_size);
+            defer self.allocator.free(stacked_target);
+            const stacked_grad   = try self.allocator.alloc(f32, max_bs * out_size);
+            defer self.allocator.free(stacked_grad);
+            const stacked_gin    = try self.allocator.alloc(f32, max_bs * in_size);
+            defer self.allocator.free(stacked_gin);
+
+            for (0..config.epochs) |epoch| {
+                var total_loss: f32 = 0;
+
+                si = 0;
+                while (si < samples.len) : (si += config.batch_size) {
+                    const batch_end = @min(si + config.batch_size, samples.len);
+                    const batch     = samples[si..batch_end];
+                    const bs        = batch_end - si;
+                    const bs_f: f32 = @floatFromInt(bs);
+
+                    t += 1;
+                    const lr = config.lr_schedule.get(config.lr, t);
+
+                    // Stack inputs and targets
+                    for (batch, 0..) |s, j| {
+                        @memcpy(stacked_input [j * in_size  ..][0..in_size ], s.input);
+                        @memcpy(stacked_target[j * out_size ..][0..out_size], s.target);
+                    }
+
+                    // Single forward pass over the stacked batch
+                    self.model.batchForward(
+                        stacked_input[0..bs * in_size],
+                        stacked_output[0..bs * out_size],
+                        bs,
+                    );
+
+                    // Compute loss and grad on CPU — data is already there after batchForward.
+                    // Use inv_batch so each element's gradient is normalised over the full batch.
+                    // This avoids bs separate GPU command buffer submissions for the loss kernel.
+                    const CpuLoss = @import("backend/cpu.zig").CpuLoss;
+                    const inv_batch = 1.0 / @as(f32, @floatFromInt(bs * out_size));
+                    total_loss += CpuLoss.mse(
+                        stacked_output[0..bs * out_size],
+                        stacked_target[0..bs * out_size],
+                        stacked_grad[0..bs * out_size],
+                        inv_batch,
+                    );
+
+                    // Single backward pass
+                    self.model.batchBackward(
+                        stacked_grad[0..bs * out_size],
+                        stacked_gin[0..bs * in_size],
+                        bs,
+                    );
+
+                    // Gradient clipping (global norm) — grads are on CPU after downloadGrads
+                    if (config.grad_clip > 0) {
+                        if (comptime @hasDecl(ModelBase, "gradNormSq") and
+                                    @hasDecl(ModelBase, "scaleGrads")) {
+                            const norm_sq = self.model.gradNormSq();
+                            const norm    = @sqrt(norm_sq);
+                            if (norm > config.grad_clip) {
+                                self.model.scaleGrads(config.grad_clip / norm);
+                            }
+                        }
+                    }
+
+                    self.model.updateWeights(config.optimizer, lr, t);
+                    _ = bs_f;
                 }
 
                 if (config.log_every > 0 and (epoch + 1) % config.log_every == 0) {

@@ -45,3 +45,9 @@ pub const OptimizerImpl = @import("backend.zig").OptimizerImpl;
 /// Metal compute engine — GPU buffer management and kernel dispatch.
 pub const MetalEngine = @import("metal/engine.zig").MetalEngine;
 
+/// Return a pointer to the singleton Metal engine (initialises it on first call).
+/// Only meaningful when compiling with a Metal-capable target.
+pub fn getMetalEngine() !*MetalEngine {
+    return @import("backend/metal.zig").getEngine();
+}
+

@@ -45,6 +45,11 @@ pub fn TransformerStack(
         last_seq:  usize,
         allocator: std.mem.Allocator,
 
+        /// Cached tiled PE buffer for batchForward (Metal only).
+        /// Lazily allocated on first batch call; reused when batch shape is unchanged.
+        tiled_pe:     ?[]f32,
+        tiled_pe_len: usize,
+
         const Self = @This();
 
         //  init / deinit
@@ -54,9 +59,11 @@ pub fn TransformerStack(
             const self = try allocator.create(Self);
             errdefer allocator.destroy(self);
 
-            self.allocator = allocator;
-            self.last_seq  = 0;
-            self.pos_embed = PE.init();
+            self.allocator    = allocator;
+            self.last_seq     = 0;
+            self.tiled_pe     = null;
+            self.tiled_pe_len = 0;
+            self.pos_embed    = PE.init();
 
             var n: usize = 0;
             errdefer for (0..n) |i| self.blocks[i].deinit();
@@ -74,6 +81,7 @@ pub fn TransformerStack(
         /// Free all blocks and the stack struct itself.
         pub fn deinit(self: *Self) void {
             for (&self.blocks) |b| b.deinit();
+            if (self.tiled_pe) |buf| self.allocator.free(buf);
             self.allocator.destroy(self);
         }
 
@@ -100,7 +108,7 @@ pub fn TransformerStack(
                 var buf_cur = FO.encodeAdd(eng, buf_input, buf_embed, smd, 50);
                 // All blocks in one recording
                 inline for (0..n_layers) |i| {
-                    buf_cur = self.blocks[i].encodeForward(eng, buf_cur, seq);
+                    buf_cur = self.blocks[i].encodeForward(eng, buf_cur, seq, 0);
                 }
                 eng.commitAndWait();
                 eng.downloadTo(buf_cur, output[0..smd]);
@@ -122,6 +130,89 @@ pub fn TransformerStack(
                     self.act_bufs[i][0..smd];
 
                 self.blocks[i].forwardSeq(cur_in, cur_out, seq);
+            }
+        }
+
+        //  batch forward/backward (Metal only)
+
+        /// Metal-only batch forward: stacks N samples into one GPU pass using block-diagonal
+        /// attention masking so each sample attends only to its own tokens.
+        ///
+        /// stacked_input  -- [n_samples * seq_per * d_model]
+        /// stacked_output -- [n_samples * seq_per * d_model]
+        pub fn batchForward(self: *Self, stacked_input: []const f32, stacked_output: []f32, n_samples: usize) void {
+            comptime std.debug.assert(backend == .metal);
+            const mb = @import("backend/metal.zig");
+            const FO = mb.FusedOps;
+            const eng = mb.getEngine() catch @panic("Metal init failed");
+            eng.waitIfPending();
+
+            const seq_total = stacked_input.len / d_model;
+            const seq_per   = seq_total / n_samples;
+            const smd_total = seq_total * d_model;
+            const smd_per   = seq_per * d_model;
+            self.last_seq   = seq_total;
+
+            // Build tiled PE: repeat pos_embed[0..smd_per] N times.
+            // Reuse cached buffer when shape is unchanged (common in training loops).
+            if (self.tiled_pe_len != smd_total) {
+                if (self.tiled_pe) |old| self.allocator.free(old);
+                self.tiled_pe     = self.allocator.alloc(f32, smd_total) catch @panic("batchForward PE alloc");
+                self.tiled_pe_len = smd_total;
+            }
+            const tiled_pe = self.tiled_pe.?;
+            for (0..n_samples) |s| {
+                @memcpy(tiled_pe[s * smd_per ..][0..smd_per], self.pos_embed.embed[0..smd_per]);
+            }
+
+            const buf_input = eng.getOrUpload(stacked_input);
+            const buf_embed = eng.getOrUpload(tiled_pe);
+
+            eng.beginRecording();
+            var buf_cur = FO.encodeAdd(eng, buf_input, buf_embed, smd_total, 50);
+            inline for (0..n_layers) |i| {
+                buf_cur = self.blocks[i].encodeForward(eng, buf_cur, seq_total, seq_per);
+            }
+            eng.commitAndWait();
+            eng.downloadTo(buf_cur, stacked_output[0..smd_total]);
+        }
+
+        /// Metal-only batch backward: backward pass over stacked N-sample batch.
+        ///
+        /// stacked_grad_out -- [n_samples * seq_per * d_model] (loss gradient)
+        /// stacked_grad_in  -- [n_samples * seq_per * d_model] (written: grad w.r.t. input)
+        pub fn batchBackward(self: *Self, stacked_grad_out: []const f32, stacked_grad_in: []f32, n_samples: usize) void {
+            comptime std.debug.assert(backend == .metal);
+            const mb = @import("backend/metal.zig");
+            const eng = mb.getEngine() catch @panic("Metal init failed");
+            eng.waitIfPending();
+
+            const seq_total = self.last_seq;
+            const seq_per   = seq_total / n_samples;
+            const smd_total = seq_total * d_model;
+            const smd_per   = seq_per * d_model;
+
+            inline for (0..n_layers) |i| {
+                self.blocks[i].prepareBackwardUploads(eng, seq_total);
+            }
+
+            const buf_go = eng.getOrUpload(stacked_grad_out[0..smd_total]);
+            eng.beginRecording();
+            var buf_gi = buf_go;
+            inline for (0..n_layers) |rev| {
+                const i = n_layers - 1 - rev;
+                buf_gi = self.blocks[i].encodeBackward(eng, buf_gi, seq_total);
+            }
+            eng.commitAndWait();
+
+            eng.downloadTo(buf_gi, stacked_grad_in[0..smd_total]);
+            inline for (0..n_layers) |i| {
+                self.blocks[i].downloadGrads(eng);
+            }
+
+            // PE grad: sum tile-wise (each sample contributes to same PE positions)
+            for (0..n_samples) |s| {
+                for (self.pos_embed.grad_embed[0..smd_per], stacked_grad_in[s * smd_per ..][0..smd_per]) |*ge, gi| ge.* += gi;
             }
         }
 
@@ -196,6 +287,29 @@ pub fn TransformerStack(
 
         /// Update all submodule weights using the given optimizer.
         pub fn updateWeights(self: *Self, opt: Optimizer, lr: f32, t: usize) void {
+            if (comptime backend == .metal) {
+                const mb = @import("backend/metal.zig");
+                const eng = mb.getEngine() catch @panic("Metal init failed");
+                eng.waitIfPending();
+                switch (opt.kind) {
+                    .sgd => |_| {
+                        self.pos_embed.updateWeights(opt, lr, t);
+                        for (&self.blocks) |b| b.updateWeights(opt, lr, t);
+                        return;
+                    },
+                    else => {},
+                }
+                // Fused: all blocks' Adam in one command buffer
+                eng.beginRecording();
+                inline for (0..n_layers) |i| {
+                    self.blocks[i].encodeAdamAll(eng, opt, lr, t);
+                }
+                eng.commitAndWait();
+                for (&self.blocks) |b| b.zeroGrads();
+                self.pos_embed.updateWeights(opt, lr, t);
+                return;
+            }
+            // CPU path
             self.pos_embed.updateWeights(opt, lr, t);
             for (&self.blocks) |b| b.updateWeights(opt, lr, t);
         }

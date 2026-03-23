@@ -2,6 +2,13 @@
 /// Uses a single TransformerBlock (1 layer) with small dimensions.
 const std    = @import("std");
 const zaneml = @import("zaneml");
+const eng_ptr = struct {
+    var eng: ?*zaneml.MetalEngine = null;
+    fn get() *zaneml.MetalEngine {
+        if (eng == null) eng = zaneml.getMetalEngine() catch @panic("Metal init failed");
+        return eng.?;
+    }
+};
 
 const BACKEND  = .metal;
 const D_MODEL  = 16;
@@ -96,14 +103,17 @@ pub fn main() !void {
             block.ffn2.weights_compute_buffer[i] = orig + eps;
             // Sync f32 -> f16 so forward uses perturbed weight
             block.ffn2.weights[i] = @floatCast(block.ffn2.weights_compute_buffer[i]);
+            _ = eng_ptr.get().getOrUpload(block.ffn2.weights_compute_buffer);
             const loss_plus = forwardLoss(block, &input, &target, &output_plus);
 
             block.ffn2.weights_compute_buffer[i] = orig - eps;
             block.ffn2.weights[i] = @floatCast(block.ffn2.weights_compute_buffer[i]);
+            _ = eng_ptr.get().getOrUpload(block.ffn2.weights_compute_buffer);
             const loss_minus = forwardLoss(block, &input, &target, &output_minus);
 
             block.ffn2.weights_compute_buffer[i] = orig;
             block.ffn2.weights[i] = @floatCast(orig);
+            _ = eng_ptr.get().getOrUpload(block.ffn2.weights_compute_buffer);
 
             const numerical = (loss_plus - loss_minus) / (2.0 * eps);
             const analytical = block.ffn2.grad_w[i];
@@ -124,10 +134,13 @@ pub fn main() !void {
         for (0..n_check) |i| {
             const orig = block.ffn2.biases[i];
             block.ffn2.biases[i] = orig + eps;
+            _ = eng_ptr.get().getOrUpload(block.ffn2.biases);
             const loss_plus = forwardLoss(block, &input, &target, &output_plus);
             block.ffn2.biases[i] = orig - eps;
+            _ = eng_ptr.get().getOrUpload(block.ffn2.biases);
             const loss_minus = forwardLoss(block, &input, &target, &output_minus);
             block.ffn2.biases[i] = orig;
+            _ = eng_ptr.get().getOrUpload(block.ffn2.biases);
 
             const numerical = (loss_plus - loss_minus) / (2.0 * eps);
             const analytical = block.ffn2.grad_b[i];
@@ -149,12 +162,15 @@ pub fn main() !void {
             const orig = block.ffn1.weights_compute_buffer[i];
             block.ffn1.weights_compute_buffer[i] = orig + eps;
             block.ffn1.weights[i] = @floatCast(block.ffn1.weights_compute_buffer[i]);
+            _ = eng_ptr.get().getOrUpload(block.ffn1.weights_compute_buffer);
             const loss_plus = forwardLoss(block, &input, &target, &output_plus);
             block.ffn1.weights_compute_buffer[i] = orig - eps;
             block.ffn1.weights[i] = @floatCast(block.ffn1.weights_compute_buffer[i]);
+            _ = eng_ptr.get().getOrUpload(block.ffn1.weights_compute_buffer);
             const loss_minus = forwardLoss(block, &input, &target, &output_minus);
             block.ffn1.weights_compute_buffer[i] = orig;
             block.ffn1.weights[i] = @floatCast(orig);
+            _ = eng_ptr.get().getOrUpload(block.ffn1.weights_compute_buffer);
 
             const numerical = (loss_plus - loss_minus) / (2.0 * eps);
             const analytical = block.ffn1.grad_w[i];
@@ -177,12 +193,15 @@ pub fn main() !void {
             const orig_f16 = block.attn.wo[i];
             block.attn.wo_f[i] = orig_f32 + eps;
             block.attn.wo[i] = @floatCast(block.attn.wo_f[i]);
+            _ = eng_ptr.get().getOrUpload(@as([]const f32, &block.attn.wo_f));
             const loss_plus = forwardLoss(block, &input, &target, &output_plus);
             block.attn.wo_f[i] = orig_f32 - eps;
             block.attn.wo[i] = @floatCast(block.attn.wo_f[i]);
+            _ = eng_ptr.get().getOrUpload(@as([]const f32, &block.attn.wo_f));
             const loss_minus = forwardLoss(block, &input, &target, &output_minus);
             block.attn.wo_f[i] = orig_f32;
             block.attn.wo[i] = orig_f16;
+            _ = eng_ptr.get().getOrUpload(@as([]const f32, &block.attn.wo_f));
 
             const numerical = (loss_plus - loss_minus) / (2.0 * eps);
             const analytical = block.attn.grad_wo[i];
@@ -205,12 +224,15 @@ pub fn main() !void {
             const orig_f16 = block.attn.wq[i];
             block.attn.wq_f[i] = orig_f32 + eps;
             block.attn.wq[i] = @floatCast(block.attn.wq_f[i]);
+            _ = eng_ptr.get().getOrUpload(@as([]const f32, &block.attn.wq_f));
             const loss_plus = forwardLoss(block, &input, &target, &output_plus);
             block.attn.wq_f[i] = orig_f32 - eps;
             block.attn.wq[i] = @floatCast(block.attn.wq_f[i]);
+            _ = eng_ptr.get().getOrUpload(@as([]const f32, &block.attn.wq_f));
             const loss_minus = forwardLoss(block, &input, &target, &output_minus);
             block.attn.wq_f[i] = orig_f32;
             block.attn.wq[i] = orig_f16;
+            _ = eng_ptr.get().getOrUpload(@as([]const f32, &block.attn.wq_f));
 
             const numerical = (loss_plus - loss_minus) / (2.0 * eps);
             const analytical = block.attn.grad_wq[i];
@@ -231,10 +253,13 @@ pub fn main() !void {
         for (0..n_check) |i| {
             const orig = block.norm1.gamma[i];
             block.norm1.gamma[i] = orig + eps;
+            _ = eng_ptr.get().getOrUpload(block.norm1.gamma[0..D_MODEL]);
             const loss_plus = forwardLoss(block, &input, &target, &output_plus);
             block.norm1.gamma[i] = orig - eps;
+            _ = eng_ptr.get().getOrUpload(block.norm1.gamma[0..D_MODEL]);
             const loss_minus = forwardLoss(block, &input, &target, &output_minus);
             block.norm1.gamma[i] = orig;
+            _ = eng_ptr.get().getOrUpload(block.norm1.gamma[0..D_MODEL]);
 
             const numerical = (loss_plus - loss_minus) / (2.0 * eps);
             const analytical = block.norm1.grad_gamma[i];

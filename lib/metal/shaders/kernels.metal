@@ -784,6 +784,7 @@ struct AttnScoreParams {
     uint  d_head;
     float scale;
     uint  causal;
+    uint  block_size;  // > 0 → block-diagonal mask (stacked-batch mode)
 };
 
 // scores[h, i, j] = sum_dk(Q[i, h*d_head+dk] * K[j, h*d_head+dk]) * scale
@@ -806,6 +807,7 @@ kernel void attn_scores_fwd(
         s += Q[i * dm + ho + dk] * K[j * dm + ho + dk];
     s *= p.scale;
     if (p.causal && j > i) s = -1e9f;
+    if (p.block_size > 0 && (i / p.block_size != j / p.block_size)) s = -1e9f;
     scores[h * p.seq * p.seq + i * p.seq + j] = s;
 }
 

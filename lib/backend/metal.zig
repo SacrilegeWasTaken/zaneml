@@ -328,7 +328,7 @@ pub const MetalBatchFFN = struct {
 
 // ── Params structs for new kernels ───────────────────────────────────────
 
-const AttnScoreParams  = extern struct { seq: u32, n_heads: u32, d_head: u32, scale: f32, causal: u32 };
+const AttnScoreParams  = extern struct { seq: u32, n_heads: u32, d_head: u32, scale: f32, causal: u32, block_size: u32 };
 const AttnCtxParams    = extern struct { seq: u32, n_heads: u32, d_head: u32 };
 const AttnGradQKParams = extern struct { seq: u32, n_heads: u32, d_head: u32, scale: f32 };
 const SoftmaxParams    = extern struct { n_rows: u32, row_len: u32 };
@@ -561,7 +561,7 @@ pub const MetalBatchAttn = struct {
         const sp = AttnScoreParams{
             .seq = @intCast(seq), .n_heads = @intCast(n_heads),
             .d_head = @intCast(d_head), .scale = attn_scale,
-            .causal = if (causal) 1 else 0,
+            .causal = if (causal) 1 else 0, .block_size = 0,
         };
         const sc_pipe = eng.getPipeline("attn_scores_fwd") catch @panic("pipeline attn_scores_fwd");
         eng.encodeTyped(sc_pipe, &.{ buf_q, buf_k, buf_sc }, sp,
@@ -1145,7 +1145,7 @@ pub const FusedOps = struct {
     pub fn encodeAttnFwd(
         eng: *MetalEngine,
         comptime d_model: usize, comptime n_heads: usize, comptime d_head: usize,
-        attn_scale: f32, seq: usize, causal: bool,
+        attn_scale: f32, seq: usize, causal: bool, block_size: usize,
         buf_x: GpuBuffer, buf_wq: GpuBuffer, buf_wk: GpuBuffer,
         buf_wv: GpuBuffer, buf_wo: GpuBuffer,
         slot_base: u16,
@@ -1172,6 +1172,7 @@ pub const FusedOps = struct {
             .seq = @intCast(seq), .n_heads = @intCast(n_heads),
             .d_head = @intCast(d_head), .scale = attn_scale,
             .causal = if (causal) 1 else 0,
+            .block_size = @intCast(block_size),
         };
         const sc_pipe = eng.getPipeline("attn_scores_fwd") catch @panic("pipeline");
         eng.encodeTyped(sc_pipe, &.{ buf_q, buf_k, buf_sc }, sp,
