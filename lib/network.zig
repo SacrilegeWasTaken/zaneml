@@ -110,9 +110,15 @@ pub fn Network(comptime Model: type) type {
             const in_size  = samples[0].input.len;
 
             // Metal batch path: stack a full batch into one forward/backward pass.
-            // Requires the model to expose batchForward/batchBackward (TransformerStack on Metal).
-            if (comptime backend_ == .metal and @hasDecl(ModelBase, "batchForward")) {
-                try self.trainBatched(samples, config, in_size, out_size);
+            // Requires the model to expose batchForward/batchBackward and d_model_val
+            // (TransformerStack on Metal). seq_per is derived from the model's d_model, not
+            // from the batch size, so it stays correct for any topology.
+            if (comptime backend_ == .metal and
+                    @hasDecl(ModelBase, "batchForward") and
+                    @hasDecl(ModelBase, "d_model_val")) {
+                std.debug.assert(in_size % ModelBase.d_model_val == 0);
+                const seq_per = in_size / ModelBase.d_model_val;
+                try self.trainBatched(samples, config, in_size, out_size, seq_per);
                 return;
             }
 
@@ -181,7 +187,7 @@ pub fn Network(comptime Model: type) type {
 
         /// Metal batch training: stacks each batch into one forward+backward pass,
         /// reducing command buffer overhead from (2*batch_size + 1) to 3 per step.
-        fn trainBatched(self: *Self, samples: []const Sample, config: TrainConfig, in_size: usize, out_size: usize) !void {
+        fn trainBatched(self: *Self, samples: []const Sample, config: TrainConfig, in_size: usize, out_size: usize, seq_per: usize) !void {
             // Global step counter for Adam bias correction (1-based)
             var t: usize = 0;
 
@@ -206,8 +212,7 @@ pub fn Network(comptime Model: type) type {
                 while (si < samples.len) : (si += config.batch_size) {
                     const batch_end = @min(si + config.batch_size, samples.len);
                     const batch     = samples[si..batch_end];
-                    const bs        = batch_end - si;
-                    const bs_f: f32 = @floatFromInt(bs);
+                    const bs = batch_end - si;
 
                     t += 1;
                     const lr = config.lr_schedule.get(config.lr, t);
@@ -222,7 +227,7 @@ pub fn Network(comptime Model: type) type {
                     self.model.batchForward(
                         stacked_input[0..bs * in_size],
                         stacked_output[0..bs * out_size],
-                        bs,
+                        bs, seq_per,
                     );
 
                     // Compute loss and grad on CPU — data is already there after batchForward.
@@ -241,7 +246,7 @@ pub fn Network(comptime Model: type) type {
                     self.model.batchBackward(
                         stacked_grad[0..bs * out_size],
                         stacked_gin[0..bs * in_size],
-                        bs,
+                        bs, seq_per,
                     );
 
                     // Gradient clipping (global norm) — grads are on CPU after downloadGrads
@@ -257,7 +262,6 @@ pub fn Network(comptime Model: type) type {
                     }
 
                     self.model.updateWeights(config.optimizer, lr, t);
-                    _ = bs_f;
                 }
 
                 if (config.log_every > 0 and (epoch + 1) % config.log_every == 0) {

@@ -30,7 +30,8 @@ pub fn TransformerStack(
     const PE    = PEFn(backend, d_model, max_seq);
 
     return struct {
-        pub const backend_tag = backend;
+        pub const backend_tag  = backend;
+        pub const d_model_val  = d_model;
         pos_embed: PE,
         blocks:    [n_layers]*Block,
 
@@ -140,17 +141,20 @@ pub fn TransformerStack(
         ///
         /// stacked_input  -- [n_samples * seq_per * d_model]
         /// stacked_output -- [n_samples * seq_per * d_model]
-        pub fn batchForward(self: *Self, stacked_input: []const f32, stacked_output: []f32, n_samples: usize) void {
+        pub fn batchForward(self: *Self, stacked_input: []const f32, stacked_output: []f32, n_samples: usize, seq_per: usize) void {
             comptime std.debug.assert(backend == .metal);
             const mb = @import("backend/metal.zig");
             const FO = mb.FusedOps;
             const eng = mb.getEngine() catch @panic("Metal init failed");
             eng.waitIfPending();
 
-            const seq_total = stacked_input.len / d_model;
-            const seq_per   = seq_total / n_samples;
+            std.debug.assert(n_samples > 0);
+            std.debug.assert(seq_per > 0);
+            const seq_total = n_samples * seq_per;
             const smd_total = seq_total * d_model;
             const smd_per   = seq_per * d_model;
+            std.debug.assert(stacked_input.len == smd_total);
+            std.debug.assert(stacked_output.len == smd_total);
             self.last_seq   = seq_total;
 
             // Build tiled PE: repeat pos_embed[0..smd_per] N times.
@@ -181,16 +185,20 @@ pub fn TransformerStack(
         ///
         /// stacked_grad_out -- [n_samples * seq_per * d_model] (loss gradient)
         /// stacked_grad_in  -- [n_samples * seq_per * d_model] (written: grad w.r.t. input)
-        pub fn batchBackward(self: *Self, stacked_grad_out: []const f32, stacked_grad_in: []f32, n_samples: usize) void {
+        pub fn batchBackward(self: *Self, stacked_grad_out: []const f32, stacked_grad_in: []f32, n_samples: usize, seq_per: usize) void {
             comptime std.debug.assert(backend == .metal);
             const mb = @import("backend/metal.zig");
             const eng = mb.getEngine() catch @panic("Metal init failed");
             eng.waitIfPending();
 
-            const seq_total = self.last_seq;
-            const seq_per   = seq_total / n_samples;
+            std.debug.assert(n_samples > 0);
+            std.debug.assert(seq_per > 0);
+            const seq_total = n_samples * seq_per;
             const smd_total = seq_total * d_model;
             const smd_per   = seq_per * d_model;
+            std.debug.assert(stacked_grad_out.len == smd_total);
+            std.debug.assert(stacked_grad_in.len  == smd_total);
+            std.debug.assert(self.last_seq == seq_total);
 
             inline for (0..n_layers) |i| {
                 self.blocks[i].prepareBackwardUploads(eng, seq_total);
