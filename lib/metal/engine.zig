@@ -46,6 +46,12 @@ pub const MetalEngine = struct {
     /// Persistent buffer cache: keyed by CPU pointer address.
     buffer_cache: std.AutoHashMap(usize, CachedBuffer),
 
+    /// Scratch buffer pool: keyed by (byte_len << 8 | slot_index).
+    /// Scratch buffers are reused across calls — never freed until deinit.
+    /// Slot index (0-7) lets the same size have multiple live buffers
+    /// within a single forward() call (e.g. buf_z / buf_za / buf_act_out).
+    scratch_pool: std.AutoHashMap(u64, GpuBuffer),
+
     /// Active command buffer recording state.
     active_cmd_buf: ?c.MTLCommandBufferRef,
     active_encoder: ?c.MTLComputeEncoderRef,
@@ -82,6 +88,7 @@ pub const MetalEngine = struct {
             .library = library,
             .pipelines = std.StringHashMap(Pipeline).init(alloc),
             .buffer_cache = std.AutoHashMap(usize, CachedBuffer).init(alloc),
+            .scratch_pool = std.AutoHashMap(u64, GpuBuffer).init(alloc),
             .active_cmd_buf = null,
             .active_encoder = null,
             .pending_cmd_buf = null,
@@ -96,6 +103,11 @@ pub const MetalEngine = struct {
         var cache_it = self.buffer_cache.valueIterator();
         while (cache_it.next()) |entry| c.zml_metal_release_buffer(entry.gpu_buf.ref);
         self.buffer_cache.deinit();
+
+        // Release scratch buffers
+        var scratch_it = self.scratch_pool.valueIterator();
+        while (scratch_it.next()) |buf| c.zml_metal_release_buffer(buf.ref);
+        self.scratch_pool.deinit();
 
         var it = self.pipelines.valueIterator();
         while (it.next()) |pipe| c.zml_metal_release_pipeline(pipe.ref);
@@ -157,12 +169,29 @@ pub const MetalEngine = struct {
         for (dst, src[0..dst.len]) |*d, s| d.* += s;
     }
 
-    //  Raw buffer alloc (not cached, for transient intermediates) 
+    //  Raw buffer alloc (not cached, for transient intermediates)
 
     pub fn createBuffer(self: *Self, comptime T: type, count: usize) !GpuBuffer {
         const ref = c.zml_metal_create_buffer(self.device, count * @sizeOf(T));
         if (ref == null) return error.MetalBufferAllocFailed;
         return .{ .ref = ref };
+    }
+
+    /// Get (or create) a reusable scratch GPU buffer.
+    ///
+    /// Scratch buffers are pooled by (byte_len, slot_index) and never freed
+    /// until deinit — zero GPU allocation overhead after the first call per
+    /// unique (size, slot) pair.  Use distinct slot values (0, 1, 2 …) when
+    /// you need multiple live scratch buffers of the same element count within
+    /// a single forward/backward call.
+    pub fn getScratch(self: *Self, comptime T: type, count: usize, slot: u8) GpuBuffer {
+        const byte_len = count * @sizeOf(T);
+        const key: u64 = (@as(u64, byte_len) << 8) | @as(u64, slot);
+        if (self.scratch_pool.get(key)) |buf| return buf;
+        const ref = c.zml_metal_create_buffer(self.device, byte_len);
+        const buf = GpuBuffer{ .ref = ref.? };
+        self.scratch_pool.put(key, buf) catch {};
+        return buf;
     }
 
     pub fn createBufferFromSlice(self: *Self, comptime T: type, data: []const T) !GpuBuffer {
@@ -247,6 +276,46 @@ pub const MetalEngine = struct {
     ) void {
         const P = @TypeOf(params);
         self.encode(pipeline, buffers, @ptrCast(&params), @sizeOf(P), grid, tg);
+    }
+
+    /// Like encode but also sets threadgroup memory (index 0) of tg_mem_bytes bytes.
+    pub fn encodeTgMem(
+        self: *Self,
+        pipeline: Pipeline,
+        buffers: []const GpuBuffer,
+        params: ?*const anyopaque,
+        params_size: usize,
+        grid: Grid,
+        tg: Grid,
+        tg_mem_bytes: usize,
+    ) void {
+        var buf_refs: [16]c.MTLBufferRef = undefined;
+        for (buffers, 0..) |b, i| buf_refs[i] = b.ref;
+        c.zml_metal_encode_dispatch_tgmem(
+            self.active_encoder.?,
+            pipeline.ref,
+            &buf_refs,
+            @intCast(buffers.len),
+            params,
+            params_size,
+            grid.x, grid.y, grid.z,
+            tg.x, tg.y, tg.z,
+            tg_mem_bytes,
+        );
+    }
+
+    /// Typed convenience for encodeTgMem.
+    pub fn encodeTypedTgMem(
+        self: *Self,
+        pipeline: Pipeline,
+        buffers: []const GpuBuffer,
+        params: anytype,
+        grid: Grid,
+        tg: Grid,
+        tg_mem_bytes: usize,
+    ) void {
+        const P = @TypeOf(params);
+        self.encodeTgMem(pipeline, buffers, @ptrCast(&params), @sizeOf(P), grid, tg, tg_mem_bytes);
     }
 
     /// End recording, commit, and wait for GPU to finish.

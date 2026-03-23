@@ -104,7 +104,7 @@ pub fn Layer(comptime backend: __b.Backend) type {
             self.allocator.free(self.v_b);
         }
 
-        fn syncWeights(self: *Self) void {
+        pub fn syncWeights(self: *Self) void {
             for (self.weights, self.weights_compute_buffer) |w, *wf| wf.* = @floatCast(w);
         }
 

@@ -81,6 +81,9 @@ pub fn MultiHeadAttention(
         const Impl    = backend_mod.AttentionImpl(backend);
         const OptImpl = backend_mod.OptimizerImpl(backend);
 
+        /// Expose attn_scale as a public comptime constant for external callers.
+        pub const attn_scale_val: f32 = attn_scale;
+
         // ── init / deinit 
 
         /// Allocate and initialize on the heap. Xavier init for weights.
@@ -118,6 +121,14 @@ pub fn MultiHeadAttention(
         /// Destroy the heap allocation.
         pub fn deinit(self: *Self, allocator: std.mem.Allocator) void {
             allocator.destroy(self);
+        }
+
+        /// Sync f16 weights to f32 compute buffers (for Metal batch dispatch).
+        pub fn syncWeightsF32(self: *Self) void {
+            for (self.wq, &self.wq_f) |w, *wf| wf.* = @floatCast(w);
+            for (self.wk, &self.wk_f) |w, *wf| wf.* = @floatCast(w);
+            for (self.wv, &self.wv_f) |w, *wf| wf.* = @floatCast(w);
+            for (self.wo, &self.wo_f) |w, *wf| wf.* = @floatCast(w);
         }
 
         // ── forward ─────────────────────────────────────────────────────

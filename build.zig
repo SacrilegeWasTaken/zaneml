@@ -22,6 +22,7 @@ pub fn build(b: *std.Build) void {
     const perceptron_exe = addExample(b, "perceptron", "examples/perceptron.zig", target, optimize, example_imports);
     const transformer_exe = addExample(b, "transformer", "examples/transformer.zig", target, optimize, example_imports);
     const autograd_exe = addExample(b, "autograd", "examples/autograd.zig", target, optimize, example_imports);
+    const big_transformer_exe = addExample(b, "big-transformer", "examples/big_transformer.zig", target, optimize, example_imports);
 
     b.installArtifact(main_exe);
 
@@ -30,6 +31,7 @@ pub fn build(b: *std.Build) void {
     addRunStep(b, perceptron_exe, "perceptron", "Run examples/perceptron.zig");
     addRunStep(b, transformer_exe, "transformer", "Run examples/transformer.zig");
     addRunStep(b, autograd_exe, "autograd", "Run examples/autograd.zig (XOR via Tape API)");
+    addRunStep(b, big_transformer_exe, "big-transformer", "Run examples/big_transformer.zig (Metal benchmark)");
 
     // ── Tests ────────────────────────────────────────────────────────────────
 

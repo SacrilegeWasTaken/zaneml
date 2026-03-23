@@ -160,6 +160,34 @@ void zml_metal_encode_dispatch(
        threadsPerThreadgroup:MTLSizeMake(tg_x, tg_y, tg_z)];
 }
 
+void zml_metal_encode_dispatch_tgmem(
+    MTLComputeEncoderRef encoder,
+    MTLPipelineRef       pipeline,
+    MTLBufferRef*        buffers,
+    u32             buffer_count,
+    const void*          params,
+    usize               params_size,
+    u32 grid_x, u32 grid_y, u32 grid_z,
+    u32 tg_x,   u32 tg_y,   u32 tg_z,
+    usize               tg_mem_bytes
+) {
+    id<MTLComputeCommandEncoder> enc = (__bridge id<MTLComputeCommandEncoder>)encoder;
+    id<MTLComputePipelineState>  pso = (__bridge id<MTLComputePipelineState>)pipeline;
+
+    [enc setComputePipelineState:pso];
+    for (u32 i = 0; i < buffer_count; i++) {
+        [enc setBuffer:(__bridge id<MTLBuffer>)buffers[i] offset:0 atIndex:i];
+    }
+    if (params && params_size > 0) {
+        [enc setBytes:params length:params_size atIndex:buffer_count];
+    }
+    if (tg_mem_bytes > 0) {
+        [enc setThreadgroupMemoryLength:tg_mem_bytes atIndex:0];
+    }
+    [enc dispatchThreads:MTLSizeMake(grid_x, grid_y, grid_z)
+       threadsPerThreadgroup:MTLSizeMake(tg_x, tg_y, tg_z)];
+}
+
 void zml_metal_end_compute_encoder(MTLComputeEncoderRef encoder) {
     id<MTLComputeCommandEncoder> enc = (__bridge_transfer id<MTLComputeCommandEncoder>)encoder;
     [enc endEncoding];

@@ -66,6 +66,19 @@ void zml_metal_encode_dispatch(
     u32 tg_x,   u32 tg_y,   u32 tg_z
 );
 
+// Like zml_metal_encode_dispatch but also sets threadgroup memory (index 0) of tg_mem_bytes bytes.
+void zml_metal_encode_dispatch_tgmem(
+    MTLComputeEncoderRef encoder,
+    MTLPipelineRef       pipeline,
+    MTLBufferRef*        buffers,
+    u32                  buffer_count,
+    const void*          params,
+    usize                params_size,
+    u32 grid_x, u32 grid_y, u32 grid_z,
+    u32 tg_x,   u32 tg_y,   u32 tg_z,
+    usize                tg_mem_bytes
+);
+
 void zml_metal_end_compute_encoder(MTLComputeEncoderRef encoder);
 
 int  zml_metal_commit_and_wait(MTLCommandBufferRef cmd_buf);
