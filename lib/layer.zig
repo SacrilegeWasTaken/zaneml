@@ -7,6 +7,7 @@ pub const __b = @import("backend.zig");
 
 pub fn Layer(comptime backend: __b.Backend) type {
     return struct {
+        pub const backend_tag = backend;
         weights: []f16,
         biases: []f32,
         weights_compute_buffer: []f32,

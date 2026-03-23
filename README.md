@@ -58,7 +58,7 @@ exe.root_module.addImport("zaneml", zaneml.module("zaneml"));
 ```zig
 const L   = zaneml.Layer(.cpu);
 const Seq = zaneml.Sequential(struct { fc1: L, fc2: L });
-const Net = zaneml.Network(.cpu, *Seq);
+const Net = zaneml.Network(*Seq);
 
 var seq = try Seq.init(allocator, .{
     .fc1 = try L.init(allocator, .{ .n_in = 2, .n_out = 8, .activation = .relu }),
@@ -80,7 +80,7 @@ try net.train(&samples, .{
 const Stack = zaneml.TransformerStack(.cpu, 16, 2, 32, 4, 3, .{
     .norm = .layer_norm, .ffn_activation = .silu, .causal = false,
 });
-const Net = zaneml.Network(.cpu, *Stack);
+const Net = zaneml.Network(*Stack);
 
 var stack = try Stack.init(allocator);
 defer stack.deinit();
@@ -100,7 +100,7 @@ const Model = zaneml.TapeMLP(.cpu, 2, &.{
     .{ .n_out = 8, .activation = .relu },
     .{ .n_out = 1, .activation = .sigmoid },
 });
-const Net = zaneml.Network(.cpu, *Model);
+const Net = zaneml.Network(*Model);
 
 var model = try Model.init(allocator);
 defer model.deinit();

@@ -23,6 +23,12 @@ pub fn Sequential(comptime Modules: type) type {
     comptime std.debug.assert(n >= 1);
 
     return struct {
+        /// Backend tag derived from the first module.
+        pub const backend_tag = if (@hasDecl(fields[0].type, "backend_tag"))
+            fields[0].type.backend_tag
+        else
+            @import("backend.zig").Backend.cpu;
+
         modules:   Modules,
         /// Intermediate activation and gradient buffers (n-1 of each).
         /// When n==1 both arrays have zero length -- no allocations.

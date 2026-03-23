@@ -7,7 +7,7 @@ const Model = zaneml.TapeMLP(.cpu, 2, &.{
     .{ .n_out = 8, .activation = .relu },
     .{ .n_out = 1, .activation = .sigmoid },
 });
-const Net = zaneml.Network(.cpu, *Model);
+const Net = zaneml.Network(*Model);
 
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};

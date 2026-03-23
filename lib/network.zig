@@ -62,12 +62,17 @@ pub const TrainConfig = struct {
 ///   pub fn gradNormSq(self: *const Self) f32
 ///   pub fn scaleGrads(self: *Self, s: f32) void
 /// These are used for gradient clipping if grad_clip > 0.
-pub fn Network(comptime backend: Backend, comptime Model: type) type {
+pub fn Network(comptime Model: type) type {
     comptime {
         if (@typeInfo(Model) != .pointer)
-            @compileError("Network: Model must be a pointer, e.g. Network(.cpu, *MyModel)");
+            @compileError("Network: Model must be a pointer, e.g. Network(*MyModel)");
     }
-    const LossImpl = backend_mod.LossImpl(backend);
+    const ModelBase_ = @typeInfo(Model).pointer.child;
+    const backend_: Backend = if (@hasDecl(ModelBase_, "backend_tag"))
+        ModelBase_.backend_tag
+    else
+        .cpu;
+    const LossImpl = backend_mod.LossImpl(backend_);
 
     return struct {
         model:     Model,

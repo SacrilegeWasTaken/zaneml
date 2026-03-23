@@ -25,7 +25,7 @@ test "Network/Sequential: learns y = -x (single linear layer, SGD)" {
     const alloc = testing.allocator;
     const L   = Layer(.cpu);
     const Seq = Sequential(struct { fc: L });
-    const Net = Network(.cpu, *Seq);
+    const Net = Network(*Seq);
 
     var seq = try Seq.init(alloc, .{
         .fc = try L.init(alloc, .{ .n_in = 1, .n_out = 1, .activation = .linear }),
@@ -63,7 +63,7 @@ test "Network/Sequential: XOR with Adam converges" {
     const alloc = testing.allocator;
     const L   = Layer(.cpu);
     const Seq = Sequential(struct { fc1: L, fc2: L });
-    const Net = Network(.cpu, *Seq);
+    const Net = Network(*Seq);
 
     var seq = try Seq.init(alloc, .{
         .fc1 = try L.init(alloc, .{ .n_in = 2, .n_out = 8, .activation = .relu }),
@@ -102,7 +102,7 @@ test "Network/Sequential: warmup_cosine schedule runs without error" {
     const alloc = testing.allocator;
     const L   = Layer(.cpu);
     const Seq = Sequential(struct { fc: L });
-    const Net = Network(.cpu, *Seq);
+    const Net = Network(*Seq);
 
     var seq = try Seq.init(alloc, .{
         .fc = try L.init(alloc, .{ .n_in = 1, .n_out = 1, .activation = .linear }),
@@ -133,7 +133,7 @@ test "Network: batch_size=1 and batch_size=N both converge on same task" {
     const alloc = testing.allocator;
     const L   = Layer(.cpu);
     const Seq = Sequential(struct { fc: L });
-    const Net = Network(.cpu, *Seq);
+    const Net = Network(*Seq);
 
     const samples = [_]Net.Sample{
         .{ .input = &.{1.0}, .target = &.{3.0} },

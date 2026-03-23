@@ -30,7 +30,7 @@ const Stack = zaneml.TransformerStack(
     }
 );
 
-const Net   = zaneml.Network(.cpu, *Stack);
+const Net   = zaneml.Network(*Stack);
 
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};

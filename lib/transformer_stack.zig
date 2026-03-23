@@ -30,6 +30,7 @@ pub fn TransformerStack(
     const PE    = PEFn(backend, d_model, max_seq);
 
     return struct {
+        pub const backend_tag = backend;
         pos_embed: PE,
         blocks:    [n_layers]*Block,
 

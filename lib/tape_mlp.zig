@@ -23,7 +23,7 @@ pub const TapeLayerConfig = struct {
 ///       .{ .n_out = 8,  .activation = .relu },
 ///       .{ .n_out = 1,  .activation = .sigmoid },
 ///   });
-///   const Net = Network(.cpu, *Model);
+///   const Net = Network(*Model);
 ///   var model = try Model.init(allocator);
 pub fn TapeMLP(
     comptime backend: Backend,
@@ -45,6 +45,7 @@ pub fn TapeMLP(
     };
 
     return struct {
+        pub const backend_tag = backend;
         tape: TapeType,
 
         weights: [N]*Tensor,

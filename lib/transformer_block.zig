@@ -53,7 +53,8 @@ pub fn TransformerBlock(
     const Mha = MhaT(backend, d_model, n_heads, max_seq, cfg.causal);
 
     return struct {
-        //  modules 
+        pub const backend_tag = backend;
+        //  modules
         norm1: Norm,
         norm2: Norm,
         attn:  *Mha,
