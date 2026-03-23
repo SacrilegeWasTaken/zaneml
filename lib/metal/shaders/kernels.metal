@@ -1139,3 +1139,13 @@ kernel void cross_entropy_loss(
     }
     if (lid == 0) loss[0] = sh[0];
 }
+
+struct ScaleF32InplaceParams { uint length; float scale; };
+
+kernel void scale_f32_inplace(
+    device float* buf   [[buffer(0)]],
+    constant ScaleF32InplaceParams& p [[buffer(1)]],
+    uint id [[thread_position_in_grid]])
+{
+    if (id < p.length) buf[id] *= p.scale;
+}

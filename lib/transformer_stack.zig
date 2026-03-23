@@ -47,7 +47,7 @@ pub fn TransformerStack(
 
         const Self = @This();
 
-        //  init / deinit 
+        //  init / deinit
 
         /// Allocate the stack and all its blocks on the heap.
         pub fn init(allocator: std.mem.Allocator) !*Self {
@@ -62,7 +62,9 @@ pub fn TransformerStack(
             errdefer for (0..n) |i| self.blocks[i].deinit();
 
             inline for (0..n_layers) |i| {
-                self.blocks[i] = try Block.init(allocator);
+                self.blocks[i] = try Block.initWithSlots(allocator,
+                    @as(u16, 100) + @as(u16, i) * 30,   // fwd_slot_base
+                    @as(u16, 300) + @as(u16, i) * 30);  // bwd_slot_base
                 n += 1;
             }
 
@@ -75,7 +77,7 @@ pub fn TransformerStack(
             self.allocator.destroy(self);
         }
 
-        //  forward 
+        //  forward
 
         /// Forward pass: applies positional embeddings then each block in order.
         pub fn forward(self: *Self, input: []const f32, output: []f32) void {
@@ -83,7 +85,29 @@ pub fn TransformerStack(
             const smd = seq * d_model;
             self.last_seq = seq;
 
-            // input + positional embeddings -> pe_buf
+            if (comptime backend == .metal) {
+                const mb = @import("backend/metal.zig");
+                const FO = mb.FusedOps;
+                const eng = mb.getEngine() catch @panic("Metal init failed");
+                eng.waitIfPending();
+
+                // Upload PE embed
+                const buf_input = eng.getOrUpload(input);
+                const buf_embed = eng.getOrUpload(self.pos_embed.embed[0..smd]);
+
+                eng.beginRecording();
+                // PE addition (slot 50)
+                var buf_cur = FO.encodeAdd(eng, buf_input, buf_embed, smd, 50);
+                // All blocks in one recording
+                inline for (0..n_layers) |i| {
+                    buf_cur = self.blocks[i].encodeForward(eng, buf_cur, seq);
+                }
+                eng.commitAndWait();
+                eng.downloadTo(buf_cur, output[0..smd]);
+                return;
+            }
+
+            // CPU path (existing)
             self.pos_embed.forward(input, self.pe_buf[0..smd]);
 
             inline for (0..n_layers) |i| {
@@ -101,7 +125,7 @@ pub fn TransformerStack(
             }
         }
 
-        //  backward 
+        //  backward
 
         /// Backward pass: propagates gradients through blocks then positional embeddings.
         pub fn backward(self: *Self, input: []const f32, grad_out: []const f32, grad_in: []f32) !void {
@@ -109,6 +133,38 @@ pub fn TransformerStack(
             const seq = self.last_seq;
             const smd = seq * d_model;
 
+            if (comptime backend == .metal) {
+                const mb = @import("backend/metal.zig");
+                const eng = mb.getEngine() catch @panic("Metal init failed");
+                eng.waitIfPending();
+
+                // Upload gradient accumulators and params for ALL blocks before recording
+                inline for (0..n_layers) |i| {
+                    self.blocks[i].prepareBackwardUploads(eng, seq);
+                }
+
+                const buf_go = eng.getOrUpload(grad_out[0..smd]);
+                eng.beginRecording();
+                var buf_gi = buf_go;
+                // Reverse through all blocks in one recording
+                inline for (0..n_layers) |rev| {
+                    const i = n_layers - 1 - rev;
+                    buf_gi = self.blocks[i].encodeBackward(eng, buf_gi, seq);
+                }
+                eng.commitAndWait();
+
+                eng.downloadTo(buf_gi, grad_in[0..smd]);
+                // Download all gradient accumulators
+                inline for (0..n_layers) |i| {
+                    self.blocks[i].downloadGrads(eng);
+                }
+
+                // PE grad: identity pass-through
+                for (self.pos_embed.grad_embed[0..smd], grad_in[0..smd]) |*ge, gi| ge.* += gi;
+                return;
+            }
+
+            // CPU path (existing)
             inline for (0..n_layers) |rev| {
                 const i = n_layers - 1 - rev;
 
@@ -136,7 +192,7 @@ pub fn TransformerStack(
             for (self.pos_embed.grad_embed[0..smd], grad_in[0..smd]) |*ge, gi| ge.* += gi;
         }
 
-        //  weight update 
+        //  weight update
 
         /// Update all submodule weights using the given optimizer.
         pub fn updateWeights(self: *Self, opt: Optimizer, lr: f32, t: usize) void {

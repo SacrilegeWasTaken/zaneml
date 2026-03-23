@@ -46,9 +46,9 @@ pub const MetalEngine = struct {
     /// Persistent buffer cache: keyed by CPU pointer address.
     buffer_cache: std.AutoHashMap(usize, CachedBuffer),
 
-    /// Scratch buffer pool: keyed by (byte_len << 8 | slot_index).
+    /// Scratch buffer pool: keyed by (byte_len << 16 | slot_index).
     /// Scratch buffers are reused across calls — never freed until deinit.
-    /// Slot index (0-7) lets the same size have multiple live buffers
+    /// Slot index (u16) lets the same size have multiple live buffers
     /// within a single forward() call (e.g. buf_z / buf_za / buf_act_out).
     scratch_pool: std.AutoHashMap(u64, GpuBuffer),
 
@@ -157,6 +157,17 @@ pub const MetalEngine = struct {
         return self.getOrUpload(@as([]const f32, data));
     }
 
+    /// Get the GPU buffer for a CPU slice WITHOUT re-uploading contents.
+    /// Returns null if not cached (first time must use getOrUpload/getOrUploadMut).
+    pub fn getCached(self: *Self, data: []const f32) ?GpuBuffer {
+        const key = @intFromPtr(data.ptr);
+        const byte_len = data.len * @sizeOf(f32);
+        if (self.buffer_cache.get(key)) |entry| {
+            if (entry.byte_len == byte_len) return entry.gpu_buf;
+        }
+        return null;
+    }
+
     /// Download GPU buffer back to a mutable CPU slice (after GPU writes).
     pub fn downloadTo(_: *Self, buf: GpuBuffer, dst: []f32) void {
         const src = buf.asSlice(f32);
@@ -184,9 +195,9 @@ pub const MetalEngine = struct {
     /// unique (size, slot) pair.  Use distinct slot values (0, 1, 2 …) when
     /// you need multiple live scratch buffers of the same element count within
     /// a single forward/backward call.
-    pub fn getScratch(self: *Self, comptime T: type, count: usize, slot: u8) GpuBuffer {
+    pub fn getScratch(self: *Self, comptime T: type, count: usize, slot: u16) GpuBuffer {
         const byte_len = count * @sizeOf(T);
-        const key: u64 = (@as(u64, byte_len) << 8) | @as(u64, slot);
+        const key: u64 = (@as(u64, byte_len) << 16) | @as(u64, slot);
         if (self.scratch_pool.get(key)) |buf| return buf;
         const ref = c.zml_metal_create_buffer(self.device, byte_len);
         const buf = GpuBuffer{ .ref = ref.? };

@@ -1,7 +1,7 @@
 const std = @import("std");
 const Activation = @import("../activation.zig").Activation;
 const engine_mod = @import("../metal/engine.zig");
-const MetalEngine = engine_mod.MetalEngine;
+pub const MetalEngine = engine_mod.MetalEngine;
 pub const GpuBuffer = engine_mod.GpuBuffer;
 const Pipeline = engine_mod.Pipeline;
 const Grid = MetalEngine.Grid;
@@ -20,8 +20,8 @@ pub fn getEngine() !*MetalEngine {
 /// Params structs — must match MSL layout (extern struct for C ABI).
 const MatmulParams = extern struct { M: u32, K: u32, N: u32 };
 const ElementwiseParams = extern struct { length: u32 };
-const SGDParams = extern struct { length: u32, lr: f32 };
-const AdamParams = extern struct {
+pub const SGDParams = extern struct { length: u32, lr: f32 };
+pub const AdamParams = extern struct {
     length: u32,
     lr: f32,
     beta1: f32,
@@ -1082,7 +1082,7 @@ pub const FusedOps = struct {
 
     pub fn encodeLayernormFwd(
         eng: *MetalEngine, buf_x: GpuBuffer, buf_gamma: GpuBuffer, buf_beta: GpuBuffer,
-        eps: f32, seq: usize, d: usize, slot_base: u8,
+        eps: f32, seq: usize, d: usize, slot_base: u16,
     ) NormResult {
         const buf_out = eng.getScratch(f32, seq * d, slot_base);
         const buf_xn = eng.getScratch(f32, seq * d, slot_base + 1);
@@ -1097,7 +1097,7 @@ pub const FusedOps = struct {
 
     pub fn encodeRmsnormFwd(
         eng: *MetalEngine, buf_x: GpuBuffer, buf_gamma: GpuBuffer,
-        eps: f32, seq: usize, d: usize, slot_base: u8,
+        eps: f32, seq: usize, d: usize, slot_base: u16,
     ) NormResult {
         const buf_out = eng.getScratch(f32, seq * d, slot_base);
         const buf_xn = eng.getScratch(f32, seq * d, slot_base + 1);
@@ -1112,7 +1112,7 @@ pub const FusedOps = struct {
 
     pub fn encodeFFNFwd(
         eng: *MetalEngine, buf_input: GpuBuffer, buf_w: GpuBuffer, buf_b: GpuBuffer,
-        activation: Activation, n_in: usize, n_out: usize, seq: usize, slot_base: u8,
+        activation: Activation, n_in: usize, n_out: usize, seq: usize, slot_base: u16,
     ) FFNResult {
         const total = seq * n_out;
         const buf_z = eng.getScratch(f32, total, slot_base);
@@ -1148,7 +1148,7 @@ pub const FusedOps = struct {
         attn_scale: f32, seq: usize, causal: bool,
         buf_x: GpuBuffer, buf_wq: GpuBuffer, buf_wk: GpuBuffer,
         buf_wv: GpuBuffer, buf_wo: GpuBuffer,
-        slot_base: u8,
+        slot_base: u16,
     ) AttnFwdResult {
         const smd = seq * d_model;
         const shh = n_heads * seq * seq;
@@ -1198,7 +1198,7 @@ pub const FusedOps = struct {
     }
 
     /// Encode: out[i] = a[i] + b[i]
-    pub fn encodeAdd(eng: *MetalEngine, buf_a: GpuBuffer, buf_b: GpuBuffer, len: usize, slot: u8) GpuBuffer {
+    pub fn encodeAdd(eng: *MetalEngine, buf_a: GpuBuffer, buf_b: GpuBuffer, len: usize, slot: u16) GpuBuffer {
         const buf_out = eng.getScratch(f32, len, slot);
         const pipe = eng.getPipeline("add_f32") catch @panic("pipeline");
         eng.encodeTyped(pipe, &.{ buf_a, buf_b, buf_out }, ElementwiseParams{
@@ -1207,12 +1207,37 @@ pub const FusedOps = struct {
         return buf_out;
     }
 
+    const ScaleF32InplaceParams = extern struct { length: u32, scale: f32 };
+
+    /// Encode in-place scale of a GPU buffer (encode-only, no begin/commit).
+    pub fn encodeScaleF32(eng: *MetalEngine, buf: GpuBuffer, len: usize, scale: f32) void {
+        const pipe = eng.getPipeline("scale_f32_inplace") catch @panic("pipeline scale_f32_inplace");
+        eng.encodeTyped(pipe, &.{buf}, ScaleF32InplaceParams{ .length = @intCast(len), .scale = scale },
+            .{ .x = @intCast(len) }, null);
+    }
+
+    /// Encode a single Adam parameter update (encode-only, no begin/commit).
+    pub fn encodeAdamUpdate(
+        eng: *MetalEngine,
+        buf_p: GpuBuffer, buf_g: GpuBuffer, buf_m: GpuBuffer, buf_v: GpuBuffer,
+        p: AdamParams,
+    ) void {
+        const pipe = eng.getPipeline("adam_update") catch @panic("pipeline adam_update");
+        eng.encodeTyped(pipe, &.{ buf_p, buf_g, buf_m, buf_v }, p, .{ .x = p.length }, null);
+    }
+
+    /// Encode a single SGD parameter update (encode-only, no begin/commit).
+    pub fn encodeSGDUpdate(eng: *MetalEngine, buf_p: GpuBuffer, buf_g: GpuBuffer, p: SGDParams) void {
+        const pipe = eng.getPipeline("sgd_update") catch @panic("pipeline sgd_update");
+        eng.encodeTyped(pipe, &.{ buf_p, buf_g }, p, .{ .x = p.length }, null);
+    }
+
     // ── Backward encode-only helpers ──
 
     pub fn encodeFFNBwd(
         eng: *MetalEngine, buf_pre_act: GpuBuffer, buf_grad_out: GpuBuffer,
         buf_input: GpuBuffer, buf_w: GpuBuffer, buf_gw: GpuBuffer, buf_gb: GpuBuffer,
-        activation: Activation, n_in: usize, n_out: usize, seq: usize, slot_base: u8,
+        activation: Activation, n_in: usize, n_out: usize, seq: usize, slot_base: u16,
     ) struct { grad_in: GpuBuffer } {
         const total = seq * n_out;
 
@@ -1247,7 +1272,7 @@ pub const FusedOps = struct {
         eng: *MetalEngine, buf_go: GpuBuffer, buf_xn: GpuBuffer,
         buf_gamma: GpuBuffer, buf_rstd: GpuBuffer,
         buf_gg: GpuBuffer, buf_gb: GpuBuffer,
-        seq: usize, d: usize, slot: u8,
+        seq: usize, d: usize, slot: u16,
     ) GpuBuffer {
         const buf_gi = eng.getScratch(f32, seq * d, slot);
         const pipe = eng.getPipeline("layernorm_bwd_seq") catch @panic("pipeline");
@@ -1261,7 +1286,7 @@ pub const FusedOps = struct {
     pub fn encodeRmsnormBwd(
         eng: *MetalEngine, buf_go: GpuBuffer, buf_xn: GpuBuffer,
         buf_gamma: GpuBuffer, buf_rms: GpuBuffer, buf_gg: GpuBuffer,
-        seq: usize, d: usize, slot: u8,
+        seq: usize, d: usize, slot: u16,
     ) GpuBuffer {
         const buf_gi = eng.getScratch(f32, seq * d, slot);
         const pipe = eng.getPipeline("rmsnorm_bwd_seq") catch @panic("pipeline");
@@ -1280,7 +1305,7 @@ pub const FusedOps = struct {
         buf_wq: GpuBuffer, buf_wk: GpuBuffer, buf_wv: GpuBuffer, buf_wo: GpuBuffer,
         buf_cq: GpuBuffer, buf_ck: GpuBuffer, buf_cv: GpuBuffer, buf_ca: GpuBuffer, buf_cc: GpuBuffer,
         buf_gwq: GpuBuffer, buf_gwk: GpuBuffer, buf_gwv: GpuBuffer, buf_gwo: GpuBuffer,
-        slot_base: u8,
+        slot_base: u16,
     ) GpuBuffer {
         const smd = seq * d_model;
         const shh = n_heads * seq * seq;
