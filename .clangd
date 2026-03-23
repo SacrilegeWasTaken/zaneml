@@ -1,0 +1,6 @@
+CompileFlags:
+  Add:
+    - -fobjc-arc
+    - -fblocks
+    - -isysroot
+    - /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk

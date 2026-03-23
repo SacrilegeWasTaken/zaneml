@@ -32,7 +32,7 @@ pub fn MultiHeadAttention(
     const attn_scale: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(d_head)));
 
     return struct {
-        // ── weights (f16 storage, f32 compute) ─────────────────────────
+        // ── weights (f16 storage, f32 compute) 
         wq: [d_model * d_model]f16,
         wk: [d_model * d_model]f16,
         wv: [d_model * d_model]f16,
@@ -43,13 +43,13 @@ pub fn MultiHeadAttention(
         wv_f: [d_model * d_model]f32,
         wo_f: [d_model * d_model]f32,
 
-        // ── weight gradients ────────────────────────────────────────────
+        // ── weight gradients 
         grad_wq: [d_model * d_model]f32,
         grad_wk: [d_model * d_model]f32,
         grad_wv: [d_model * d_model]f32,
         grad_wo: [d_model * d_model]f32,
 
-        // ── Adam moment buffers for wq, wk, wv, wo ─────────────────────
+        // ── Adam moment buffers for wq, wk, wv, wo 
         m_wq: [d_model * d_model]f32,
         v_wq: [d_model * d_model]f32,
         m_wk: [d_model * d_model]f32,
@@ -59,20 +59,20 @@ pub fn MultiHeadAttention(
         m_wo: [d_model * d_model]f32,
         v_wo: [d_model * d_model]f32,
 
-        // ── forward cache (needed in backward) ──────────────────────────
+        // ── forward cache (needed in backward) 
         cache_q:      [max_seq * d_model]f32,          // Q = X @ W_q
         cache_k:      [max_seq * d_model]f32,          // K = X @ W_k
         cache_v:      [max_seq * d_model]f32,          // V = X @ W_v
         cache_attn:   [n_heads * max_seq * max_seq]f32, // attention weights per head
         cache_concat: [max_seq * d_model]f32,          // head concat before W_o
 
-        // ── backward buffers ────────────────────────────────────────────
+        // ── backward buffers 
         grad_q:      [max_seq * d_model]f32,
         grad_k:      [max_seq * d_model]f32,
         grad_v:      [max_seq * d_model]f32,
         grad_concat: [max_seq * d_model]f32,
 
-        // ── scratch (reused across calls) ───────────────────────────────
+        // ── scratch (reused across calls) 
         scratch: [max_seq * max_seq]f32,
 
         last_seq: usize,
@@ -81,7 +81,7 @@ pub fn MultiHeadAttention(
         const Impl    = backend_mod.AttentionImpl(backend);
         const OptImpl = backend_mod.OptimizerImpl(backend);
 
-        // ── init / deinit ───────────────────────────────────────────────
+        // ── init / deinit 
 
         /// Allocate and initialize on the heap. Xavier init for weights.
         pub fn init(allocator: std.mem.Allocator) !*Self {
@@ -141,7 +141,7 @@ pub fn MultiHeadAttention(
                 &self.scratch, causal);
         }
 
-        // ── backward ────────────────────────────────────────────────────
+        // ── backward 
 
         /// Backward pass.
         /// input:    original forward input [seq * d_model]
@@ -157,7 +157,7 @@ pub fn MultiHeadAttention(
                 &self.grad_q, &self.grad_k, &self.grad_v, &self.grad_concat, &self.scratch);
         }
 
-        // ── weight update ────────────────────────────────────────────────
+        // ── weight update 
 
         /// Update weights using the given optimizer. t is the 1-based step counter.
         pub fn updateWeights(self: *Self, opt: Optimizer, lr: f32, t: usize) void {

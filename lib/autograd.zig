@@ -87,7 +87,7 @@ pub fn Tape(comptime backend: Backend) type {
             _ = self.arena.reset(.retain_capacity);
         }
 
-        // ── internal: allocate a tape-owned intermediate tensor ────────────
+        //  internal: allocate a tape-owned intermediate tensor 
 
         fn newTensor(self: *Self, size: usize, requires_grad: bool) !*Tensor {
             const alloc = self.arena.allocator();
@@ -108,7 +108,7 @@ pub fn Tape(comptime backend: Backend) type {
             });
         }
 
-        // ── backward ──────────────────────────────────────────────────────
+        //  backward 
 
         /// Set loss.grad = 1 and replay all recorded ops in reverse.
         /// loss must be a scalar tensor (data.len == 1).
@@ -134,7 +134,7 @@ pub fn Tape(comptime backend: Backend) type {
             }
         }
 
-        // ── ops ───────────────────────────────────────────────────────────
+        //  ops 
 
         /// out = a + b  (element-wise broadcast not supported; sizes must match)
         pub fn add(self: *Self, a: *Tensor, b: *Tensor) !*Tensor {
@@ -401,7 +401,7 @@ pub fn Tape(comptime backend: Backend) type {
     };
 }
 
-// ── unit tests ────────────────────────────────────────────────────────────────
+//  unit tests 
 
 const testing = std.testing;
 const T = Tape(.cpu);

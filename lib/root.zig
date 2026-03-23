@@ -42,3 +42,6 @@ pub const TapeMLP = @import("tape_mlp.zig").TapeMLP;
 /// Backend optimizer dispatch — use in custom models that implement updateWeights.
 pub const OptimizerImpl = @import("backend.zig").OptimizerImpl;
 
+/// Metal compute engine — GPU buffer management and kernel dispatch.
+pub const MetalEngine = @import("metal/engine.zig").MetalEngine;
+

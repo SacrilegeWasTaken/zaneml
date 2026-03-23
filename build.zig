@@ -9,85 +9,32 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    // Allow @cImport("bridge.h") in metal/engine.zig to find the header
+    mod.addIncludePath(b.path("lib/metal"));
 
     const example_imports: []const std.Build.Module.Import = &.{
         .{ .name = "zaneml", .module = mod },
     };
 
-    const main_exe = b.addExecutable(.{
-        .name = "main",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("examples/main.zig"),
-            .target = target,
-            .optimize = optimize,
-            .imports = example_imports,
-        }),
-    });
+    // ── Examples ─────────────────────────────────────────────────────────────
 
-    const perceptron_exe = b.addExecutable(.{
-        .name = "perceptron",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("examples/perceptron.zig"),
-            .target = target,
-            .optimize = optimize,
-            .imports = example_imports,
-        }),
-    });
+    const main_exe = addExample(b, "main", "examples/main.zig", target, optimize, example_imports);
+    const perceptron_exe = addExample(b, "perceptron", "examples/perceptron.zig", target, optimize, example_imports);
+    const transformer_exe = addExample(b, "transformer", "examples/transformer.zig", target, optimize, example_imports);
+    const autograd_exe = addExample(b, "autograd", "examples/autograd.zig", target, optimize, example_imports);
 
     b.installArtifact(main_exe);
 
-    const run_main_cmd = b.addRunArtifact(main_exe);
-    run_main_cmd.step.dependOn(b.getInstallStep());
-    if (b.args) |args| run_main_cmd.addArgs(args);
+    addRunStep(b, main_exe, "run", "Run examples/main.zig");
+    addRunStep(b, main_exe, "main", "Run examples/main.zig");
+    addRunStep(b, perceptron_exe, "perceptron", "Run examples/perceptron.zig");
+    addRunStep(b, transformer_exe, "transformer", "Run examples/transformer.zig");
+    addRunStep(b, autograd_exe, "autograd", "Run examples/autograd.zig (XOR via Tape API)");
 
-    const run_perceptron_cmd = b.addRunArtifact(perceptron_exe);
-    if (b.args) |args| run_perceptron_cmd.addArgs(args);
-
-    const run_step = b.step("run", "Run examples/main.zig");
-    run_step.dependOn(&run_main_cmd.step);
-
-    const run_main_step = b.step("main", "Run examples/main.zig");
-    run_main_step.dependOn(&run_main_cmd.step);
-
-    const run_perceptron_step = b.step("perceptron", "Run examples/perceptron.zig");
-    run_perceptron_step.dependOn(&run_perceptron_cmd.step);
-
-    const transformer_exe = b.addExecutable(.{
-        .name = "transformer",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("examples/transformer.zig"),
-            .target = target,
-            .optimize = optimize,
-            .imports = example_imports,
-        }),
-    });
-
-    const run_transformer_cmd = b.addRunArtifact(transformer_exe);
-    if (b.args) |args| run_transformer_cmd.addArgs(args);
-
-    const run_transformer_step = b.step("transformer", "Run examples/transformer.zig");
-    run_transformer_step.dependOn(&run_transformer_cmd.step);
-
-    const autograd_exe = b.addExecutable(.{
-        .name = "autograd",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("examples/autograd_xor.zig"),
-            .target = target,
-            .optimize = optimize,
-            .imports = example_imports,
-        }),
-    });
-
-    const run_autograd_cmd = b.addRunArtifact(autograd_exe);
-    if (b.args) |args| run_autograd_cmd.addArgs(args);
-
-    const run_autograd_step = b.step("autograd", "Run examples/autograd_xor.zig (XOR via Tape API)");
-    run_autograd_step.dependOn(&run_autograd_cmd.step);
+    // ── Tests ────────────────────────────────────────────────────────────────
 
     // Unit tests — discovered transitively from lib/root.zig
-    const unit_tests = b.addTest(.{
-        .root_module = mod,
-    });
+    const unit_tests = b.addTest(.{ .root_module = mod });
     const run_unit_tests = b.addRunArtifact(unit_tests);
 
     // Integration tests — tests/ directory, imports zaneml as a dependency
@@ -110,4 +57,46 @@ pub fn build(b: *std.Build) void {
 
     const integration_test_step = b.step("test-integration", "Run integration tests only (tests/)");
     integration_test_step.dependOn(&run_integration_tests.step);
+
+    // Metal smoke tests
+    const metal_test_exe = addExample(b, "metal-test", "tests/metal_test.zig", target, optimize, example_imports);
+    addRunStep(b, metal_test_exe, "test-metal", "Run Metal compute smoke tests");
+}
+
+// ── Helpers ──────────────────────────────────────────────────────────────────
+
+/// Create an executable with zaneml imports + Metal linking (on macOS).
+fn addExample(
+    b: *std.Build,
+    name: []const u8,
+    path: []const u8,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+    imports: []const std.Build.Module.Import,
+) *std.Build.Step.Compile {
+    const exe = b.addExecutable(.{
+        .name = name,
+        .root_module = b.createModule(.{
+            .root_source_file = b.path(path),
+            .target = target,
+            .optimize = optimize,
+            .imports = imports,
+        }),
+    });
+    // Link Metal bridge + frameworks so any backend (.cpu or .metal) works
+    exe.addIncludePath(b.path("lib/metal"));
+    exe.addCSourceFile(.{
+        .file = b.path("lib/metal/bridge.m"),
+        .flags = &.{"-fobjc-arc"},
+    });
+    exe.linkFramework("Metal");
+    exe.linkFramework("Foundation");
+    return exe;
+}
+
+fn addRunStep(b: *std.Build, exe: *std.Build.Step.Compile, name: []const u8, desc: []const u8) void {
+    const run_cmd = b.addRunArtifact(exe);
+    if (b.args) |args| run_cmd.addArgs(args);
+    const step = b.step(name, desc);
+    step.dependOn(&run_cmd.step);
 }

@@ -84,11 +84,11 @@ pub fn TapeMLP(
                 for (weights[i].data) |*p| p.* = rand.floatNorm(f32) * scale;
             }
 
-            // --- input leaf -----------------------------------------------
+            //  input leaf 
             const x_t = try Tensor.createLeaf(alloc, n_in, false);
             errdefer x_t.deinit(alloc);
 
-            // --- moment buffers -------------------------------------------
+            //  moment buffers 
             var m_w: [N][]f32 = undefined;
             var v_w: [N][]f32 = undefined;
             var m_b: [N][]f32 = undefined;
@@ -182,7 +182,7 @@ pub fn TapeMLP(
     };
 }
 
-// ── activation dispatch ───────────────────────────────────────────────────────
+//  activation dispatch 
 
 fn applyActivation(
     tape: anytype,

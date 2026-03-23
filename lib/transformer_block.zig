@@ -53,37 +53,37 @@ pub fn TransformerBlock(
     const Mha = MhaT(backend, d_model, n_heads, max_seq, cfg.causal);
 
     return struct {
-        // ── modules ──────────────────────────────────────────────────────
+        //  modules 
         norm1: Norm,
         norm2: Norm,
         attn:  *Mha,
         ffn1:  Fc,    // d_model -> d_ff,    cfg.ffn_activation
         ffn2:  Fc,    // d_ff    -> d_model,  linear
 
-        // ── intermediate forward activations ─────────────────────────────
+        //  intermediate forward activations 
         norm1_out: [max_seq * d_model]f32,
         h:         [max_seq * d_model]f32,
         norm2_out: [max_seq * d_model]f32,
         ffn1_out:  [max_seq * d_ff]f32,
 
-        // ── per-position norm caches (needed in backward) ─────────────────
+        //  per-position norm caches (needed in backward) 
         // Both LayerNorm and RMSNorm expose x_norm_buf and last_rstd.
         norm1_xn:   [max_seq * d_model]f32,
         norm1_rstd: [max_seq]f32,
         norm2_xn:   [max_seq * d_model]f32,
         norm2_rstd: [max_seq]f32,
 
-        // ── per-position pre-activation Layer caches (needed in backward) ─
+        //  per-position pre-activation Layer caches (needed in backward) ─
         ffn1_pre: [max_seq * d_ff]f32,
         ffn2_pre: [max_seq * d_model]f32,
 
-        // ── backward gradient buffers ─────────────────────────────────────
+        //  backward gradient buffers 
         grad_ffn1_out:  [max_seq * d_ff]f32,
         grad_norm2_out: [max_seq * d_model]f32,
         grad_h:         [max_seq * d_model]f32,
         grad_norm1_out: [max_seq * d_model]f32,
 
-        // ── scratch: temporary buffer for per-position norm backward ──────
+        //  scratch: temporary buffer for per-position norm backward 
         scratch: [d_model]f32,
 
         last_seq:  usize,
@@ -91,7 +91,7 @@ pub fn TransformerBlock(
 
         const Self = @This();
 
-        // ── init / deinit ─────────────────────────────────────────────────
+        //  init / deinit 
 
         /// Allocate and initialize a TransformerBlock on the heap.
         pub fn init(allocator: std.mem.Allocator) !*Self {
@@ -119,7 +119,7 @@ pub fn TransformerBlock(
             self.allocator.destroy(self);
         }
 
-        // ── forward ───────────────────────────────────────────────────────
+        //  forward 
 
         /// Generic forward: seq is inferred from input.len / d_model.
         pub fn forward(self: *Self, input: []const f32, output: []f32) void {
@@ -175,7 +175,7 @@ pub fn TransformerBlock(
             for (output[0..seq * d_model], self.h[0..seq * d_model]) |*oi, hi| oi.* += hi;
         }
 
-        // ── backward ──────────────────────────────────────────────────────
+        //  backward 
 
         /// Backward pass.
         /// input    -- original forward input [seq * d_model]
@@ -241,7 +241,7 @@ pub fn TransformerBlock(
             }
         }
 
-        // ── weight update ─────────────────────────────────────────────────
+        //  weight update 
 
         /// Update all submodule weights using the given optimizer.
         pub fn updateWeights(self: *Self, opt: Optimizer, lr: f32, t: usize) void {

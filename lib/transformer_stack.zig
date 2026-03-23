@@ -46,7 +46,7 @@ pub fn TransformerStack(
 
         const Self = @This();
 
-        // ── init / deinit ─────────────────────────────────────────────────
+        //  init / deinit 
 
         /// Allocate the stack and all its blocks on the heap.
         pub fn init(allocator: std.mem.Allocator) !*Self {
@@ -74,7 +74,7 @@ pub fn TransformerStack(
             self.allocator.destroy(self);
         }
 
-        // ── forward ───────────────────────────────────────────────────────
+        //  forward 
 
         /// Forward pass: applies positional embeddings then each block in order.
         pub fn forward(self: *Self, input: []const f32, output: []f32) void {
@@ -100,7 +100,7 @@ pub fn TransformerStack(
             }
         }
 
-        // ── backward ──────────────────────────────────────────────────────
+        //  backward 
 
         /// Backward pass: propagates gradients through blocks then positional embeddings.
         pub fn backward(self: *Self, input: []const f32, grad_out: []const f32, grad_in: []f32) !void {
@@ -135,7 +135,7 @@ pub fn TransformerStack(
             for (self.pos_embed.grad_embed[0..smd], grad_in[0..smd]) |*ge, gi| ge.* += gi;
         }
 
-        // ── weight update ─────────────────────────────────────────────────
+        //  weight update 
 
         /// Update all submodule weights using the given optimizer.
         pub fn updateWeights(self: *Self, opt: Optimizer, lr: f32, t: usize) void {
