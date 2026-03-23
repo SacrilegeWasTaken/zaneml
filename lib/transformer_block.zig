@@ -137,81 +137,80 @@ pub fn TransformerBlock(
             self.last_seq = seq;
             const smd = seq * d_model;
 
-            if (comptime backend == .metal) {
+            if (comptime backend == .metal) { // fused forward
                 const mb = @import("backend/metal.zig");
+                const FO = mb.FusedOps;
+                const eng = mb.getEngine() catch @panic("Metal init failed");
+                eng.waitIfPending();
 
-                // sublayer 1: Norm1 -> Attn -> +x  (all on GPU)
-                switch (comptime cfg.norm) {
-                    .layer_norm => mb.MetalBatchNorm.layernorm_fwd(
-                        input,
-                        self.norm1.gamma[0..d_model], self.norm1.beta[0..d_model],
-                        self.norm1.eps,
-                        self.norm1_out[0..smd], self.norm1_xn[0..smd], self.norm1_rstd[0..seq],
-                        seq, d_model,
-                    ),
-                    .rms_norm => mb.MetalBatchNorm.rmsnorm_fwd(
-                        input,
-                        self.norm1.gamma[0..d_model],
-                        self.norm1.eps,
-                        self.norm1_out[0..smd], self.norm1_xn[0..smd], self.norm1_rstd[0..seq],
-                        seq, d_model,
-                    ),
-                }
-
-                self.attn.syncWeightsF32();
-                mb.MetalBatchAttn.forward(
-                    d_model, n_heads, d_model / n_heads,
-                    Mha.attn_scale_val, seq,
-                    self.norm1_out[0..smd], self.h[0..smd],
-                    &self.attn.wq_f, &self.attn.wk_f, &self.attn.wv_f, &self.attn.wo_f,
-                    self.attn.cache_q[0..smd],
-                    self.attn.cache_k[0..smd],
-                    self.attn.cache_v[0..smd],
-                    self.attn.cache_attn[0..n_heads * seq * seq],
-                    self.attn.cache_concat[0..smd],
-                    cfg.causal,
-                );
-
-                for (self.h[0..smd], input) |*hi, xi| hi.* += xi;
-
-                // sublayer 2: Norm2 -> FFN -> +h  (all on GPU)
-                switch (comptime cfg.norm) {
-                    .layer_norm => mb.MetalBatchNorm.layernorm_fwd(
-                        self.h[0..smd],
-                        self.norm2.gamma[0..d_model], self.norm2.beta[0..d_model],
-                        self.norm2.eps,
-                        self.norm2_out[0..smd], self.norm2_xn[0..smd], self.norm2_rstd[0..seq],
-                        seq, d_model,
-                    ),
-                    .rms_norm => mb.MetalBatchNorm.rmsnorm_fwd(
-                        self.h[0..smd],
-                        self.norm2.gamma[0..d_model],
-                        self.norm2.eps,
-                        self.norm2_out[0..smd], self.norm2_xn[0..smd], self.norm2_rstd[0..seq],
-                        seq, d_model,
-                    ),
-                }
-
+                // Sync and upload all weights once
                 self.ffn1.syncWeights();
-                mb.MetalBatchFFN.forward(
-                    self.ffn1.weights_compute_buffer,
-                    self.norm2_out[0..smd],
-                    self.ffn1.biases,
-                    self.ffn1_pre[0..seq * d_ff],
-                    self.ffn1_out[0..seq * d_ff],
-                    cfg.ffn_activation,
-                    d_model, d_ff, seq,
-                );
                 self.ffn2.syncWeights();
-                mb.MetalBatchFFN.forward(
-                    self.ffn2.weights_compute_buffer,
-                    self.ffn1_out[0..seq * d_ff],
-                    self.ffn2.biases,
-                    self.ffn2_pre[0..smd],
-                    output[0..smd],
-                    .linear,
-                    d_ff, d_model, seq,
-                );
+                self.attn.syncWeightsF32();
+
+                const buf_input  = eng.getOrUpload(input);
+                const buf_gamma1 = eng.getOrUpload(self.norm1.gamma[0..d_model]);
+                const buf_gamma2 = eng.getOrUpload(self.norm2.gamma[0..d_model]);
+                const buf_wq = eng.getOrUpload(&self.attn.wq_f);
+                const buf_wk = eng.getOrUpload(&self.attn.wk_f);
+                const buf_wv = eng.getOrUpload(&self.attn.wv_f);
+                const buf_wo = eng.getOrUpload(&self.attn.wo_f);
+                const buf_f1w = eng.getOrUpload(self.ffn1.weights_compute_buffer);
+                const buf_f1b = eng.getOrUpload(self.ffn1.biases);
+                const buf_f2w = eng.getOrUpload(self.ffn2.weights_compute_buffer);
+                const buf_f2b = eng.getOrUpload(self.ffn2.biases);
+
+                eng.beginRecording();
+
+                // Norm1
+                const n1 = switch (cfg.norm) {
+                    .layer_norm => FO.encodeLayernormFwd(eng, buf_input, buf_gamma1, eng.getOrUpload(self.norm1.beta[0..d_model]), self.norm1.eps, seq, d_model, 100),
+                    .rms_norm => FO.encodeRmsnormFwd(eng, buf_input, buf_gamma1, self.norm1.eps, seq, d_model, 100),
+                };
+
+                // Attention
+                const attn_r = FO.encodeAttnFwd(eng, d_model, n_heads, d_model / n_heads,
+                    Mha.attn_scale_val, seq, cfg.causal,
+                    n1.out, buf_wq, buf_wk, buf_wv, buf_wo, 103);
+
+                // Residual: h = attn_out + input
+                const buf_h = FO.encodeAdd(eng, attn_r.output, buf_input, smd, 109);
+
+                // Norm2
+                const n2 = switch (cfg.norm) {
+                    .layer_norm => FO.encodeLayernormFwd(eng, buf_h, buf_gamma2, eng.getOrUpload(self.norm2.beta[0..d_model]), self.norm2.eps, seq, d_model, 110),
+                    .rms_norm => FO.encodeRmsnormFwd(eng, buf_h, buf_gamma2, self.norm2.eps, seq, d_model, 110),
+                };
+
+                // FFN1
+                const f1 = FO.encodeFFNFwd(eng, n2.out, buf_f1w, buf_f1b, cfg.ffn_activation, d_model, d_ff, seq, 113);
+
+                // FFN2
+                const f2 = FO.encodeFFNFwd(eng, f1.output, buf_f2w, buf_f2b, .linear, d_ff, d_model, seq, 116);
+
+                // Residual: output = ffn2_out + h
+                const buf_final = FO.encodeAdd(eng, f2.output, buf_h, smd, 119);
+
+                // Single GPU submission for entire forward
+                eng.commitAndWait();
+
+                // Download caches needed for backward
+                eng.downloadTo(n1.x_norm, self.norm1_xn[0..smd]);
+                eng.downloadTo(n1.rstd, self.norm1_rstd[0..seq]);
+                eng.downloadTo(attn_r.q, self.attn.cache_q[0..smd]);
+                eng.downloadTo(attn_r.k, self.attn.cache_k[0..smd]);
+                eng.downloadTo(attn_r.v, self.attn.cache_v[0..smd]);
+                eng.downloadTo(attn_r.scores, self.attn.cache_attn[0..n_heads * seq * seq]);
+                eng.downloadTo(attn_r.ctx, self.attn.cache_concat[0..smd]);
+                eng.downloadTo(buf_h, self.h[0..smd]);
+                eng.downloadTo(n1.out, self.norm1_out[0..smd]);
+                eng.downloadTo(n2.x_norm, self.norm2_xn[0..smd]);
+                eng.downloadTo(n2.rstd, self.norm2_rstd[0..seq]);
+                eng.downloadTo(n2.out, self.norm2_out[0..smd]);
+                eng.downloadTo(f1.pre_act, self.ffn1_pre[0..seq * d_ff]);
+                eng.downloadTo(f1.output, self.ffn1_out[0..seq * d_ff]);
+                eng.downloadTo(f2.pre_act, self.ffn2_pre[0..smd]);
+                eng.downloadTo(buf_final, output[0..smd]);
             } else {
                 // sublayer 1: Norm1 -> Attn -> +x
                 for (0..seq) |t| {
@@ -251,7 +250,10 @@ pub fn TransformerBlock(
                 }
             }
 
-            for (output[0..smd], self.h[0..smd]) |*oi, hi| oi.* += hi;
+            // CPU path: residual add (Metal path handles this in the fused GPU recording)
+            if (comptime backend != .metal) {
+                for (output[0..smd], self.h[0..smd]) |*oi, hi| oi.* += hi;
+            }
         }
 
         //  backward 
@@ -273,127 +275,109 @@ pub fn TransformerBlock(
 
             if (comptime backend == .metal) {
                 const mb = @import("backend/metal.zig");
+                const FO = mb.FusedOps;
+                const eng = mb.getEngine() catch @panic("Metal init failed");
+                eng.waitIfPending();
 
-                // ffn2 backward: batch over all seq positions
-                try mb.MetalBatchFFN.backward(
-                    self.allocator,
-                    self.ffn2.weights_compute_buffer,
-                    self.ffn1_out[0..seq * d_ff],
-                    self.ffn2_pre[0..seq * d_model],
-                    grad_out[0..smd],
-                    self.grad_ffn1_out[0..seq * d_ff],
-                    self.ffn2.grad_w,
-                    self.ffn2.grad_b,
-                    .linear,
-                    d_ff, d_model, seq,
-                );
-                // ffn1 backward: batch over all seq positions
-                try mb.MetalBatchFFN.backward(
-                    self.allocator,
-                    self.ffn1.weights_compute_buffer,
-                    self.norm2_out[0..seq * d_model],
-                    self.ffn1_pre[0..seq * d_ff],
-                    self.grad_ffn1_out[0..seq * d_ff],
-                    self.grad_norm2_out[0..smd],
-                    self.ffn1.grad_w,
-                    self.ffn1.grad_b,
-                    cfg.ffn_activation,
-                    d_model, d_ff, seq,
-                );
+                // Upload all data needed for backward
+                const buf_go = eng.getOrUpload(grad_out[0..smd]);
+                const buf_n1_out = eng.getOrUpload(self.norm1_out[0..smd]);
+                const buf_n1_xn = eng.getOrUpload(self.norm1_xn[0..smd]);
+                const buf_n1_rstd = eng.getOrUpload(self.norm1_rstd[0..seq]);
+                const buf_n2_xn = eng.getOrUpload(self.norm2_xn[0..smd]);
+                const buf_n2_rstd = eng.getOrUpload(self.norm2_rstd[0..seq]);
+                const buf_n2_out = eng.getOrUpload(self.norm2_out[0..smd]);
+                const buf_f1_pre = eng.getOrUpload(self.ffn1_pre[0..seq * d_ff]);
+                const buf_f1_out = eng.getOrUpload(self.ffn1_out[0..seq * d_ff]);
+                const buf_f2_pre = eng.getOrUpload(self.ffn2_pre[0..smd]);
 
-                // Norm2 backward (batch GPU)
-                switch (comptime cfg.norm) {
-                    .layer_norm => mb.MetalBatchNorm.layernorm_bwd(
-                        self.grad_norm2_out[0..smd],
-                        self.norm2_xn[0..smd],
-                        self.norm2.gamma[0..d_model],
-                        self.norm2_rstd[0..seq],
-                        self.norm2.grad_gamma[0..d_model],
-                        self.norm2.grad_beta[0..d_model],
-                        self.grad_h[0..smd],   // grad_in of norm2 = grad_h contribution
-                        seq, d_model,
-                    ),
-                    .rms_norm => mb.MetalBatchNorm.rmsnorm_bwd(
-                        self.grad_norm2_out[0..smd],
-                        self.norm2_xn[0..smd],
-                        self.norm2.gamma[0..d_model],
-                        self.norm2_rstd[0..seq],
-                        self.norm2.grad_gamma[0..d_model],
-                        self.grad_h[0..smd],
-                        seq, d_model,
-                    ),
-                }
-                // Add residual: grad_h already contains grad_out + norm2_grad_in
-                // (The norm backward wrote into self.grad_h so it IS the combined gradient.)
-                // We need grad_h = original grad_out + norm2_grad_in.
-                // The norm bwd wrote grad_in of norm2 into self.grad_h, but we need to add
-                // the original grad_out (residual path). Restore original grad_out first.
-                // Actually: self.grad_h was set to grad_out at top. We must ADD the norm2 grad_in.
-                // But MetalBatchNorm.layernorm_bwd WRITES (not adds) to the grad_in buffer.
-                // Use a temporary buffer for norm2 grad_in and then add to grad_h.
-                // Redo with temp buffer approach:
+                const buf_gamma1 = eng.getOrUpload(self.norm1.gamma[0..d_model]);
+                const buf_gamma2 = eng.getOrUpload(self.norm2.gamma[0..d_model]);
+                const buf_gg1 = eng.getOrUploadMut(self.norm1.grad_gamma[0..d_model]);
+                const buf_gg2 = eng.getOrUploadMut(self.norm2.grad_gamma[0..d_model]);
 
-                // Actually we need a scratch buffer. Let's use norm1_out as temp (it's done being used).
-                // Better: re-issue norm2 bwd with temp buffer, then add.
-                // The call above already WROTE into self.grad_h, overwriting it.
-                // We need: new_grad_h = original_grad_out + norm2_grad_in_of_h
-                // Since we wrote norm2_grad_in into self.grad_h, we need to add grad_out back.
-                for (self.grad_h[0..smd], grad_out[0..smd]) |*gh, go| gh.* += go;
+                const buf_wq = eng.getOrUpload(&self.attn.wq_f);
+                const buf_wk = eng.getOrUpload(&self.attn.wk_f);
+                const buf_wv = eng.getOrUpload(&self.attn.wv_f);
+                const buf_wo = eng.getOrUpload(&self.attn.wo_f);
+                const buf_cq = eng.getOrUpload(self.attn.cache_q[0..smd]);
+                const buf_ck = eng.getOrUpload(self.attn.cache_k[0..smd]);
+                const buf_cv = eng.getOrUpload(self.attn.cache_v[0..smd]);
+                const buf_ca = eng.getOrUpload(self.attn.cache_attn[0..n_heads * seq * seq]);
+                const buf_cc = eng.getOrUpload(self.attn.cache_concat[0..smd]);
+                const buf_gwq = eng.getOrUploadMut(&self.attn.grad_wq);
+                const buf_gwk = eng.getOrUploadMut(&self.attn.grad_wk);
+                const buf_gwv = eng.getOrUploadMut(&self.attn.grad_wv);
+                const buf_gwo = eng.getOrUploadMut(&self.attn.grad_wo);
 
-                // Attention backward (batch GPU)
-                mb.MetalBatchAttn.backward(
-                    d_model, n_heads, d_model / n_heads,
+                const buf_f2w = eng.getOrUpload(self.ffn2.weights_compute_buffer);
+                const buf_f1w = eng.getOrUpload(self.ffn1.weights_compute_buffer);
+                const buf_f2_gw = eng.getOrUploadMut(self.ffn2.grad_w);
+                const buf_f1_gw = eng.getOrUploadMut(self.ffn1.grad_w);
+                const buf_f2_gb = eng.getOrUploadMut(self.ffn2.grad_b);
+                const buf_f1_gb = eng.getOrUploadMut(self.ffn1.grad_b);
+
+                eng.beginRecording();
+
+                // FFN2 backward
+                const f2_bwd = FO.encodeFFNBwd(eng, buf_f2_pre, buf_go, buf_f1_out, buf_f2w,
+                    buf_f2_gw, buf_f2_gb, .linear, d_ff, d_model, seq, 200);
+
+                // FFN1 backward
+                const f1_bwd = FO.encodeFFNBwd(eng, buf_f1_pre, f2_bwd.grad_in, buf_n2_out, buf_f1w,
+                    buf_f1_gw, buf_f1_gb, cfg.ffn_activation, d_model, d_ff, seq, 203);
+
+                // Norm2 backward
+                const buf_n2_gi = switch (cfg.norm) {
+                    .layer_norm => FO.encodeLayernormBwd(eng, f1_bwd.grad_in, buf_n2_xn,
+                        buf_gamma2, buf_n2_rstd, buf_gg2, eng.getOrUploadMut(self.norm2.grad_beta[0..d_model]), seq, d_model, 206),
+                    .rms_norm => FO.encodeRmsnormBwd(eng, f1_bwd.grad_in, buf_n2_xn,
+                        buf_gamma2, buf_n2_rstd, buf_gg2, seq, d_model, 206),
+                };
+
+                // Residual: grad_h = grad_out + norm2_grad_in
+                const buf_grad_h = FO.encodeAdd(eng, buf_go, buf_n2_gi, smd, 207);
+
+                // Attention backward
+                const buf_attn_gi = FO.encodeAttnBwd(eng, d_model, n_heads, d_model / n_heads,
                     Mha.attn_scale_val, seq,
-                    self.norm1_out[0..smd],
-                    self.grad_h[0..smd],
-                    self.grad_norm1_out[0..smd],
-                    &self.attn.wq_f, &self.attn.wk_f, &self.attn.wv_f, &self.attn.wo_f,
-                    self.attn.cache_q[0..smd],
-                    self.attn.cache_k[0..smd],
-                    self.attn.cache_v[0..smd],
-                    self.attn.cache_attn[0..n_heads * seq * seq],
-                    self.attn.cache_concat[0..smd],
-                    &self.attn.grad_wq, &self.attn.grad_wk, &self.attn.grad_wv, &self.attn.grad_wo,
-                    &self.attn.grad_q, &self.attn.grad_k, &self.attn.grad_v,
-                    &self.attn.grad_concat,
-                    &self.attn.scratch,
-                );
+                    buf_n1_out, buf_grad_h,
+                    buf_wq, buf_wk, buf_wv, buf_wo,
+                    buf_cq, buf_ck, buf_cv, buf_ca, buf_cc,
+                    buf_gwq, buf_gwk, buf_gwv, buf_gwo,
+                    208);
 
-                // grad_in = grad_h (residual from attn sublayer) + norm1_grad_in
-                // self.grad_norm1_out now holds grad_in of attention w.r.t. norm1_out
-                // We need norm1 backward to get grad_in w.r.t. input
-                // Use grad_in as a temp, then add residual
-                switch (comptime cfg.norm) {
-                    .layer_norm => mb.MetalBatchNorm.layernorm_bwd(
-                        self.grad_norm1_out[0..smd],
-                        self.norm1_xn[0..smd],
-                        self.norm1.gamma[0..d_model],
-                        self.norm1_rstd[0..seq],
-                        self.norm1.grad_gamma[0..d_model],
-                        self.norm1.grad_beta[0..d_model],
-                        grad_in[0..smd],
-                        seq, d_model,
-                    ),
-                    .rms_norm => mb.MetalBatchNorm.rmsnorm_bwd(
-                        self.grad_norm1_out[0..smd],
-                        self.norm1_xn[0..smd],
-                        self.norm1.gamma[0..d_model],
-                        self.norm1_rstd[0..seq],
-                        self.norm1.grad_gamma[0..d_model],
-                        grad_in[0..smd],
-                        seq, d_model,
-                    ),
+                // Norm1 backward
+                const buf_n1_gi = switch (cfg.norm) {
+                    .layer_norm => FO.encodeLayernormBwd(eng, buf_attn_gi, buf_n1_xn,
+                        buf_gamma1, buf_n1_rstd, buf_gg1, eng.getOrUploadMut(self.norm1.grad_beta[0..d_model]), seq, d_model, 220),
+                    .rms_norm => FO.encodeRmsnormBwd(eng, buf_attn_gi, buf_n1_xn,
+                        buf_gamma1, buf_n1_rstd, buf_gg1, seq, d_model, 220),
+                };
+
+                // Final residual: grad_in = norm1_grad_in + grad_h
+                const buf_final_gi = FO.encodeAdd(eng, buf_n1_gi, buf_grad_h, smd, 221);
+
+                eng.commitAndWait();
+
+                // Download weight gradients
+                eng.downloadTo(buf_f2_gw, self.ffn2.grad_w);
+                eng.downloadTo(buf_f2_gb, self.ffn2.grad_b);
+                eng.downloadTo(buf_f1_gw, self.ffn1.grad_w);
+                eng.downloadTo(buf_f1_gb, self.ffn1.grad_b);
+                eng.downloadTo(buf_gg1, self.norm1.grad_gamma[0..d_model]);
+                eng.downloadTo(buf_gg2, self.norm2.grad_gamma[0..d_model]);
+                if (comptime cfg.norm == .layer_norm) {
+                    // Beta grad buffers were uploaded inline; read them back via getOrUploadMut cache
+                    eng.downloadTo(eng.getOrUploadMut(self.norm1.grad_beta[0..d_model]), self.norm1.grad_beta[0..d_model]);
+                    eng.downloadTo(eng.getOrUploadMut(self.norm2.grad_beta[0..d_model]), self.norm2.grad_beta[0..d_model]);
                 }
-                // Add residual path (grad_h from attn sublayer passes through residual)
-                // grad_in += grad_h (where grad_h = grad flowing through the residual connection)
-                // After attention backward, self.grad_norm1_out holds dL/d(norm1_out).
-                // The residual adds: grad_in += grad_h (the upstream gradient that bypassed attn/norm1).
-                // self.grad_h holds the grad at the "h" node = grad_out_attn_sublayer
-                // The residual path: grad_in += self.grad_h - grad_norm1_out_contribution
-                // Actually for pre-LN: h = attn(norm1(x)) + x, so grad_in_from_residual = grad_h
-                // and grad_in_from_attn = norm1_bwd(attn_bwd(grad_h)).
-                // Total: grad_in = grad_in_from_attn + grad_h
-                for (grad_in[0..smd], self.grad_h[0..smd]) |*gi, gh| gi.* += gh;
+                eng.downloadTo(buf_gwo, &self.attn.grad_wo);
+                eng.downloadTo(buf_gwq, &self.attn.grad_wq);
+                eng.downloadTo(buf_gwk, &self.attn.grad_wk);
+                eng.downloadTo(buf_gwv, &self.attn.grad_wv);
+                eng.downloadTo(buf_final_gi, grad_in[0..smd]);
+
             } else {
                 for (0..seq) |t| {
                     @memcpy(self.ffn2.pre_activation_buffer, self.ffn2_pre[t * d_model ..][0..d_model]);

@@ -2,14 +2,15 @@ const std = @import("std");
 const Activation = @import("../activation.zig").Activation;
 const engine_mod = @import("../metal/engine.zig");
 const MetalEngine = engine_mod.MetalEngine;
-const GpuBuffer = engine_mod.GpuBuffer;
+pub const GpuBuffer = engine_mod.GpuBuffer;
+const Pipeline = engine_mod.Pipeline;
 const Grid = MetalEngine.Grid;
 
-// ── Lazy singleton 
+// ── Lazy singleton
 
 var g_engine: ?MetalEngine = null;
 
-fn getEngine() !*MetalEngine {
+pub fn getEngine() !*MetalEngine {
     if (g_engine == null) {
         g_engine = try MetalEngine.init(std.heap.page_allocator);
     }
@@ -29,6 +30,44 @@ const AdamParams = extern struct {
     weight_decay: f32,
     t: u32,
 };
+
+// ── Tiled matmul helpers ─────────────────────────────────────────────────
+
+const TILE: u32 = 16;
+const TG_MEM: usize = 2 * TILE * TILE * @sizeOf(f32); // 2048 bytes
+
+/// Round up to next multiple of TILE.
+fn tileAlign(x: u32) u32 {
+    return ((x + TILE - 1) / TILE) * TILE;
+}
+
+/// Encode a tiled matmul dispatch (with threadgroup memory).
+fn encodeTiledMatmul(
+    eng: *MetalEngine,
+    pipe: Pipeline,
+    bufs: []const GpuBuffer,
+    params: MatmulParams,
+    out_rows: u32,
+    out_cols: u32,
+) void {
+    eng.encodeTypedTgMem(pipe, bufs, params, .{ .x = tileAlign(out_cols), .y = tileAlign(out_rows) }, .{ .x = TILE, .y = TILE }, TG_MEM);
+}
+
+const ActBwdParams = extern struct { length: u32, act_type: u32 };
+const ReduceBiasParams = extern struct { seq: u32, n_out: u32 };
+
+fn activationTypeId(act: Activation) u32 {
+    return switch (act) {
+        .linear => 0,
+        .relu => 1,
+        .sigmoid => 2,
+        .tanh => 3,
+        .silu => 4,
+        .gelu => 5,
+        .leaky_relu => @panic("leaky_relu not yet on Metal"),
+        .elu => @panic("elu not yet on Metal"),
+    };
+}
 
 // MetalBackend — Linear layer forward/backward
 
@@ -59,10 +98,9 @@ pub const MetalBackend = struct {
         eng.beginRecording();
 
         // z = W @ x
-        const matmul_pipe = eng.getPipeline("matmul_f32") catch @panic("pipeline");
-        eng.encodeTyped(matmul_pipe, &.{ buf_w, buf_x, buf_z }, MatmulParams{
-            .M = @intCast(n_out), .K = @intCast(n_in), .N = 1,
-        }, .{ .x = 1, .y = @intCast(n_out) }, null);
+        const matmul_pipe = eng.getPipeline("matmul_tiled_f32") catch @panic("pipeline");
+        const mp = MatmulParams{ .M = @intCast(n_out), .K = @intCast(n_in), .N = 1 };
+        encodeTiledMatmul(eng, matmul_pipe, &.{ buf_w, buf_x, buf_z }, mp, mp.M, mp.N);
 
         // za = z + bias
         const add_pipe = eng.getPipeline("add_f32") catch @panic("pipeline");
@@ -132,17 +170,15 @@ pub const MetalBackend = struct {
 
         eng.beginRecording();
 
-        const matmul_pipe = try eng.getPipeline("matmul_f32");
+        const matmul_pipe = try eng.getPipeline("matmul_tiled_f32");
 
         // grad_w = delta[n_out×1] @ input[1×n_in] → [n_out×n_in]
-        eng.encodeTyped(matmul_pipe, &.{ buf_delta, buf_input, buf_gw }, MatmulParams{
-            .M = @intCast(n_out), .K = 1, .N = @intCast(n_in),
-        }, .{ .x = @intCast(n_in), .y = @intCast(n_out) }, null);
+        const mp_gw = MatmulParams{ .M = @intCast(n_out), .K = 1, .N = @intCast(n_in) };
+        encodeTiledMatmul(eng, matmul_pipe, &.{ buf_delta, buf_input, buf_gw }, mp_gw, mp_gw.M, mp_gw.N);
 
         // grad_in = delta[1×n_out] @ W[n_out×n_in] → [1×n_in]
-        eng.encodeTyped(matmul_pipe, &.{ buf_delta, buf_w, buf_gi }, MatmulParams{
-            .M = 1, .K = @intCast(n_out), .N = @intCast(n_in),
-        }, .{ .x = @intCast(n_in), .y = 1 }, null);
+        const mp_gi = MatmulParams{ .M = 1, .K = @intCast(n_out), .N = @intCast(n_in) };
+        encodeTiledMatmul(eng, matmul_pipe, &.{ buf_delta, buf_w, buf_gi }, mp_gi, mp_gi.M, mp_gi.N);
 
         // Single GPU submission
         eng.commitAndWait();
@@ -191,10 +227,9 @@ pub const MetalBatchFFN = struct {
         eng.beginRecording();
 
         // z[seq×n_out] = input_batch[seq×n_in] × W^T[n_out×n_in]
-        const bT_pipe = eng.getPipeline("matmul_bT_f32") catch @panic("pipeline");
-        eng.encodeTyped(bT_pipe, &.{ buf_x, buf_w, buf_z }, MatmulParams{
-            .M = @intCast(seq), .K = @intCast(n_in), .N = @intCast(n_out),
-        }, .{ .x = @intCast(n_out), .y = @intCast(seq) }, null);
+        const bT_pipe = eng.getPipeline("matmul_bT_tiled_f32") catch @panic("pipeline");
+        const mp_fwd = MatmulParams{ .M = @intCast(seq), .K = @intCast(n_in), .N = @intCast(n_out) };
+        encodeTiledMatmul(eng, bT_pipe, &.{ buf_x, buf_w, buf_z }, mp_fwd, mp_fwd.M, mp_fwd.N);
 
         // za[seq×n_out] = z + broadcast(bias)
         const bias_pipe = eng.getPipeline("add_bias_batch_f32") catch @panic("pipeline");
@@ -240,21 +275,17 @@ pub const MetalBatchFFN = struct {
         n_out: usize,
         seq: usize,
     ) !void {
+        _ = allocator;
         const eng = try getEngine();
         eng.waitIfPending();
         const total = seq * n_out;
 
-        // delta[seq×n_out] = grad_out * act'(pre_act)  — CPU
-        const cpu = @import("cpu.zig");
-        const delta = try allocator.alloc(f32, total);
-        defer allocator.free(delta);
-        for (delta, pre_act_batch, grad_out_batch) |*di, pre, go| {
-            di.* = go * cpu.applyActivationBackward(activation, pre);
-        }
-
-        const buf_delta = eng.getOrUpload(delta);
+        const buf_pre   = eng.getOrUpload(pre_act_batch);
+        const buf_go    = eng.getOrUpload(grad_out_batch);
         const buf_input = eng.getOrUpload(input_batch);
         const buf_w     = eng.getOrUpload(weights);
+        const buf_gb    = eng.getOrUploadMut(grad_b);
+        const buf_delta = eng.getScratch(f32, total, 50);    // GPU-side delta
         const buf_gw    = eng.getScratch(f32, n_out * n_in, 3);
         const buf_gi    = eng.getScratch(f32, seq * n_in, 4);
 
@@ -263,26 +294,33 @@ pub const MetalBatchFFN = struct {
 
         eng.beginRecording();
 
-        const matmul_pipe = try eng.getPipeline("matmul_f32");
-        const bw_b_pipe   = try eng.getPipeline("matmul_backward_b");
+        // delta[seq×n_out] = grad_out * act'(pre_act)  — GPU
+        const act_bwd_pipe = try eng.getPipeline("fused_act_backward");
+        eng.encodeTyped(act_bwd_pipe, &.{ buf_pre, buf_go, buf_delta }, ActBwdParams{
+            .length = @intCast(total), .act_type = activationTypeId(activation),
+        }, .{ .x = @intCast(total) }, null);
+
+        const bw_b_pipe = try eng.getPipeline("matmul_backward_b_tiled");
+        const matmul_pipe = try eng.getPipeline("matmul_tiled_f32");
 
         // grad_w[n_out×n_in] += delta_batch^T @ input_batch
-        // matmul_backward_b: dB[K×N] += A^T[K×M] × dC[M×N]
-        // A=delta_batch(M=seq, K=n_out), dC=input_batch(M=seq, N=n_in), dB=grad_w(K=n_out, N=n_in)
-        eng.encodeTyped(bw_b_pipe, &.{ buf_delta, buf_input, buf_gw }, MatmulParams{
-            .M = @intCast(seq), .K = @intCast(n_out), .N = @intCast(n_in),
-        }, .{ .x = @intCast(n_in), .y = @intCast(n_out) }, null);
+        const mp_gw = MatmulParams{ .M = @intCast(seq), .K = @intCast(n_out), .N = @intCast(n_in) };
+        encodeTiledMatmul(eng, bw_b_pipe, &.{ buf_delta, buf_input, buf_gw }, mp_gw, mp_gw.K, mp_gw.N);
 
         // grad_in_batch[seq×n_in] = delta_batch[seq×n_out] @ W[n_out×n_in]
-        eng.encodeTyped(matmul_pipe, &.{ buf_delta, buf_w, buf_gi }, MatmulParams{
-            .M = @intCast(seq), .K = @intCast(n_out), .N = @intCast(n_in),
-        }, .{ .x = @intCast(n_in), .y = @intCast(seq) }, null);
+        const mp_gi = MatmulParams{ .M = @intCast(seq), .K = @intCast(n_out), .N = @intCast(n_in) };
+        encodeTiledMatmul(eng, matmul_pipe, &.{ buf_delta, buf_w, buf_gi }, mp_gi, mp_gi.M, mp_gi.N);
+
+        // grad_b[n_out] += sum over seq of delta — GPU
+        const rb_pipe = try eng.getPipeline("reduce_bias_grad");
+        eng.encodeTyped(rb_pipe, &.{ buf_delta, buf_gb }, ReduceBiasParams{
+            .seq = @intCast(seq), .n_out = @intCast(n_out),
+        }, .{ .x = @intCast(n_out) }, null);
 
         eng.commitAndWait();
 
         eng.downloadAccumTo(buf_gw, grad_w);
-        // grad_b += sum over positions
-        for (0..total) |k| grad_b[k % n_out] += delta[k];
+        eng.downloadTo(buf_gb, grad_b);
         @memset(grad_in_batch, 0);
         eng.downloadTo(buf_gi, grad_in_batch);
     }
@@ -322,7 +360,6 @@ pub const MetalBatchNorm = struct {
         const buf_xn  = eng.getScratch(f32, seq * d, 6);
         const buf_rs  = eng.getScratch(f32, seq,     7);
 
-        const LNFwdParams = extern struct { d: u32, eps: f32 };
         eng.beginRecording();
         const pipe = eng.getPipeline("layernorm_fwd_seq") catch @panic("pipeline layernorm_fwd_seq");
         // threadgroup size = d, grid = (d, seq), threadgroup memory = d floats
@@ -359,7 +396,6 @@ pub const MetalBatchNorm = struct {
         const buf_gb  = eng.getOrUploadMut(grad_beta);
         const buf_gi  = eng.getScratch(f32, seq * d, 8);
 
-        const LNBwdParams = extern struct { d: u32 };
         eng.beginRecording();
         const pipe = eng.getPipeline("layernorm_bwd_seq") catch @panic("pipeline layernorm_bwd_seq");
         const tg = MetalEngine.Grid{ .x = @intCast(d), .y = 1 };
@@ -391,7 +427,6 @@ pub const MetalBatchNorm = struct {
         const buf_xn  = eng.getScratch(f32, seq * d, 6);
         const buf_rms = eng.getScratch(f32, seq,     7);
 
-        const RMSFwdParams = extern struct { d: u32, eps: f32 };
         eng.beginRecording();
         const pipe = eng.getPipeline("rmsnorm_fwd_seq") catch @panic("pipeline rmsnorm_fwd_seq");
         const tg = MetalEngine.Grid{ .x = @intCast(d), .y = 1 };
@@ -424,7 +459,6 @@ pub const MetalBatchNorm = struct {
         const buf_gg  = eng.getOrUploadMut(grad_gamma);
         const buf_gi  = eng.getScratch(f32, seq * d, 8);
 
-        const RMSBwdParams = extern struct { d: u32 };
         eng.beginRecording();
         const pipe = eng.getPipeline("rmsnorm_bwd_seq") catch @panic("pipeline rmsnorm_bwd_seq");
         const tg = MetalEngine.Grid{ .x = @intCast(d), .y = 1 };
@@ -517,11 +551,11 @@ pub const MetalBatchAttn = struct {
         eng.beginRecording();
 
         // Q = input × Wq^T,  K = input × Wk^T,  V = input × Wv^T
-        const bT  = eng.getPipeline("matmul_bT_f32") catch @panic("pipeline matmul_bT_f32");
+        const bT  = eng.getPipeline("matmul_bT_tiled_f32") catch @panic("pipeline matmul_bT_tiled_f32");
         const mp  = MatmulParams{ .M = @intCast(seq), .K = @intCast(d_model), .N = @intCast(d_model) };
-        eng.encodeTyped(bT, &.{ buf_x, buf_wq, buf_q }, mp, .{ .x = @intCast(d_model), .y = @intCast(seq) }, null);
-        eng.encodeTyped(bT, &.{ buf_x, buf_wk, buf_k }, mp, .{ .x = @intCast(d_model), .y = @intCast(seq) }, null);
-        eng.encodeTyped(bT, &.{ buf_x, buf_wv, buf_v }, mp, .{ .x = @intCast(d_model), .y = @intCast(seq) }, null);
+        encodeTiledMatmul(eng, bT, &.{ buf_x, buf_wq, buf_q }, mp, mp.M, mp.N);
+        encodeTiledMatmul(eng, bT, &.{ buf_x, buf_wk, buf_k }, mp, mp.M, mp.N);
+        encodeTiledMatmul(eng, bT, &.{ buf_x, buf_wv, buf_v }, mp, mp.M, mp.N);
 
         // attention scores [n_heads × seq × seq]
         const sp = AttnScoreParams{
@@ -549,8 +583,7 @@ pub const MetalBatchAttn = struct {
             .{ .x = @intCast(d_head), .y = @intCast(seq), .z = @intCast(n_heads) }, null);
 
         // output = context × Wo^T
-        eng.encodeTyped(bT, &.{ buf_ctx, buf_wo, buf_out }, mp,
-            .{ .x = @intCast(d_model), .y = @intCast(seq) }, null);
+        encodeTiledMatmul(eng, bT, &.{ buf_ctx, buf_wo, buf_out }, mp, mp.M, mp.N);
 
         eng.commitAndWait();
 
@@ -636,28 +669,27 @@ pub const MetalBatchAttn = struct {
 
         eng.beginRecording();
 
-        const bT      = eng.getPipeline("matmul_bT_f32")      catch @panic("pipeline matmul_bT_f32");
-        const bwB     = eng.getPipeline("matmul_backward_b")  catch @panic("pipeline matmul_backward_b");
+        const bT      = eng.getPipeline("matmul_bT_tiled_f32")      catch @panic("pipeline matmul_bT_tiled_f32");
+        const bwB     = eng.getPipeline("matmul_backward_b_tiled") catch @panic("pipeline matmul_backward_b_tiled");
         const gv_pipe = eng.getPipeline("attn_grad_v")        catch @panic("pipeline attn_grad_v");
         const gp_pipe = eng.getPipeline("attn_grad_attn_pre") catch @panic("pipeline attn_grad_attn_pre");
         const sb_pipe = eng.getPipeline("softmax_bwd_rows")   catch @panic("pipeline softmax_bwd_rows");
         const gq_pipe = eng.getPipeline("attn_grad_q")        catch @panic("pipeline attn_grad_q");
         const gk_pipe = eng.getPipeline("attn_grad_k")        catch @panic("pipeline attn_grad_k");
+        const add3_pipe = eng.getPipeline("add3_f32")          catch @panic("pipeline add3_f32");
 
         const dm32: u32 = @intCast(d_model);
         const sq32: u32 = @intCast(seq);
         const nh32: u32 = @intCast(n_heads);
         const dh32: u32 = @intCast(d_head);
 
-        // grad_wo += concat^T @ grad_out  (matmul_backward_b accumulates +=)
-        eng.encodeTyped(bwB, &.{ buf_cc, buf_go, buf_gwo },
-            MatmulParams{ .M = sq32, .K = dm32, .N = dm32 },
-            .{ .x = dm32, .y = dm32 }, null);
+        const mp = MatmulParams{ .M = sq32, .K = dm32, .N = dm32 };
+
+        // grad_wo += concat^T @ grad_out  (matmul_backward_b_tiled accumulates +=)
+        encodeTiledMatmul(eng, bwB, &.{ buf_cc, buf_go, buf_gwo }, mp, mp.K, mp.N);
 
         // grad_concat = grad_out × Wo^T  (overwrites buf_gc)
-        eng.encodeTyped(bT, &.{ buf_go, buf_wo_b, buf_gc },
-            MatmulParams{ .M = sq32, .K = dm32, .N = dm32 },
-            .{ .x = dm32, .y = sq32 }, null);
+        encodeTiledMatmul(eng, bT, &.{ buf_go, buf_wo_b, buf_gc }, mp, mp.M, mp.N);
 
         const ctx_p = AttnCtxParams{ .seq = sq32, .n_heads = nh32, .d_head = dh32 };
 
@@ -686,22 +718,26 @@ pub const MetalBatchAttn = struct {
         eng.encodeTyped(gk_pipe, &.{ buf_gp, buf_cq, buf_gk }, qk_p,
             .{ .x = dh32, .y = sq32, .z = nh32 }, null);
 
-        const mp = MatmulParams{ .M = sq32, .K = dm32, .N = dm32 };
-
         // grad_wq += input^T @ grad_q  (accumulates +=)
-        eng.encodeTyped(bwB, &.{ buf_x, buf_gq, buf_gwq }, mp, .{ .x = dm32, .y = dm32 }, null);
+        encodeTiledMatmul(eng, bwB, &.{ buf_x, buf_gq, buf_gwq }, mp, mp.K, mp.N);
         // grad_in contribution from Q projection (overwrites buf_gi_q)
-        eng.encodeTyped(bT,  &.{ buf_gq, buf_wq_b, buf_gi_q }, mp, .{ .x = dm32, .y = sq32 }, null);
+        encodeTiledMatmul(eng, bT, &.{ buf_gq, buf_wq_b, buf_gi_q }, mp, mp.M, mp.N);
 
         // grad_wk += input^T @ grad_k  (accumulates +=)
-        eng.encodeTyped(bwB, &.{ buf_x, buf_gk, buf_gwk }, mp, .{ .x = dm32, .y = dm32 }, null);
+        encodeTiledMatmul(eng, bwB, &.{ buf_x, buf_gk, buf_gwk }, mp, mp.K, mp.N);
         // grad_in contribution from K projection (overwrites buf_gi_k)
-        eng.encodeTyped(bT,  &.{ buf_gk, buf_wk_b, buf_gi_k }, mp, .{ .x = dm32, .y = sq32 }, null);
+        encodeTiledMatmul(eng, bT, &.{ buf_gk, buf_wk_b, buf_gi_k }, mp, mp.M, mp.N);
 
         // grad_wv += input^T @ grad_v  (accumulates +=)
-        eng.encodeTyped(bwB, &.{ buf_x, buf_gv, buf_gwv }, mp, .{ .x = dm32, .y = dm32 }, null);
+        encodeTiledMatmul(eng, bwB, &.{ buf_x, buf_gv, buf_gwv }, mp, mp.K, mp.N);
         // grad_in contribution from V projection (overwrites buf_gi_v)
-        eng.encodeTyped(bT,  &.{ buf_gv, buf_wv_b, buf_gi_v }, mp, .{ .x = dm32, .y = sq32 }, null);
+        encodeTiledMatmul(eng, bT, &.{ buf_gv, buf_wv_b, buf_gi_v }, mp, mp.M, mp.N);
+
+        // Sum three grad_in contributions on GPU (instead of CPU)
+        const buf_gi = eng.getScratch(f32, smd, 25);
+        eng.encodeTyped(add3_pipe, &.{ buf_gi_q, buf_gi_k, buf_gi_v, buf_gi }, ElementwiseParams{
+            .length = @intCast(smd),
+        }, .{ .x = @intCast(smd) }, null);
 
         eng.commitAndWait();
 
@@ -713,15 +749,7 @@ pub const MetalBatchAttn = struct {
         eng.downloadTo(buf_gk,  grad_k);
         eng.downloadTo(buf_gv,  grad_v);
         eng.downloadTo(buf_gc,  grad_concat[0..smd]);
-
-        // Accumulate three separate grad_in contributions on CPU
-        @memset(grad_in[0..smd], 0);
-        const gi_q_sl = buf_gi_q.asSlice(f32)[0..smd];
-        const gi_k_sl = buf_gi_k.asSlice(f32)[0..smd];
-        const gi_v_sl = buf_gi_v.asSlice(f32)[0..smd];
-        for (grad_in[0..smd], gi_q_sl, gi_k_sl, gi_v_sl) |*gi, gq, gk, gv| {
-            gi.* = gq + gk + gv;
-        }
+        eng.downloadTo(buf_gi,  grad_in[0..smd]);
     }
 };
 
@@ -750,10 +778,9 @@ pub const MetalMatmul = struct {
         const buf_out = eng.getScratch(f32, m * n, 0);
 
         eng.beginRecording();
-        const pipe = eng.getPipeline("matmul_f32") catch @panic("pipeline");
-        eng.encodeTyped(pipe, &.{ buf_a, buf_b, buf_out }, MatmulParams{
-            .M = @intCast(m), .K = @intCast(k), .N = @intCast(n),
-        }, .{ .x = @intCast(n), .y = @intCast(m) }, null);
+        const pipe = eng.getPipeline("matmul_tiled_f32") catch @panic("pipeline");
+        const mp = MatmulParams{ .M = @intCast(m), .K = @intCast(k), .N = @intCast(n) };
+        encodeTiledMatmul(eng, pipe, &.{ buf_a, buf_b, buf_out }, mp, mp.M, mp.N);
         eng.commitAndWait();
 
         eng.downloadTo(buf_out, out);
@@ -768,10 +795,9 @@ pub const MetalMatmul = struct {
         const buf_ga = eng.getOrUploadMut(grad_a);
 
         eng.beginRecording();
-        const pipe = eng.getPipeline("matmul_backward_a") catch @panic("pipeline");
-        eng.encodeTyped(pipe, &.{ buf_gc, buf_b, buf_ga }, MatmulParams{
-            .M = @intCast(m), .K = @intCast(k), .N = @intCast(n),
-        }, .{ .x = @intCast(k), .y = @intCast(m) }, null);
+        const pipe = eng.getPipeline("matmul_backward_a_tiled") catch @panic("pipeline");
+        const mp = MatmulParams{ .M = @intCast(m), .K = @intCast(k), .N = @intCast(n) };
+        encodeTiledMatmul(eng, pipe, &.{ buf_gc, buf_b, buf_ga }, mp, mp.M, mp.K);
         eng.commitAndWait();
 
         eng.downloadTo(buf_ga, grad_a);
@@ -786,10 +812,9 @@ pub const MetalMatmul = struct {
         const buf_gb = eng.getOrUploadMut(grad_b);
 
         eng.beginRecording();
-        const pipe = eng.getPipeline("matmul_backward_b") catch @panic("pipeline");
-        eng.encodeTyped(pipe, &.{ buf_a, buf_gc, buf_gb }, MatmulParams{
-            .M = @intCast(m), .K = @intCast(k), .N = @intCast(n),
-        }, .{ .x = @intCast(n), .y = @intCast(k) }, null);
+        const pipe = eng.getPipeline("matmul_backward_b_tiled") catch @panic("pipeline");
+        const mp = MatmulParams{ .M = @intCast(m), .K = @intCast(k), .N = @intCast(n) };
+        encodeTiledMatmul(eng, pipe, &.{ buf_a, buf_gc, buf_gb }, mp, mp.K, mp.N);
         eng.commitAndWait();
 
         eng.downloadTo(buf_gb, grad_b);
@@ -1034,5 +1059,305 @@ pub const MetalDropout = struct {
             .{ .x = @intCast(len) }, null);
         eng.commitAndWait();
         eng.downloadTo(buf_gi, grad_in);
+    }
+};
+
+// ── FusedOps: encode-only helpers for recording within an active command buffer ──
+// These do NOT call beginRecording/commitAndWait/downloadTo.
+// Caller must manage the recording lifecycle.
+
+pub const NormResult = struct { out: GpuBuffer, x_norm: GpuBuffer, rstd: GpuBuffer };
+pub const FFNResult = struct { pre_act: GpuBuffer, output: GpuBuffer };
+pub const AttnFwdResult = struct {
+    q: GpuBuffer, k: GpuBuffer, v: GpuBuffer,
+    scores: GpuBuffer, ctx: GpuBuffer, output: GpuBuffer,
+};
+
+const LNFwdParams = extern struct { d: u32, eps: f32 };
+const LNBwdParams = extern struct { d: u32 };
+const RMSFwdParams = extern struct { d: u32, eps: f32 };
+const RMSBwdParams = extern struct { d: u32 };
+
+pub const FusedOps = struct {
+
+    pub fn encodeLayernormFwd(
+        eng: *MetalEngine, buf_x: GpuBuffer, buf_gamma: GpuBuffer, buf_beta: GpuBuffer,
+        eps: f32, seq: usize, d: usize, slot_base: u8,
+    ) NormResult {
+        const buf_out = eng.getScratch(f32, seq * d, slot_base);
+        const buf_xn = eng.getScratch(f32, seq * d, slot_base + 1);
+        const buf_rs = eng.getScratch(f32, seq, slot_base + 2);
+        const pipe = eng.getPipeline("layernorm_fwd_seq") catch @panic("pipeline");
+        const tg = Grid{ .x = @intCast(d), .y = 1 };
+        eng.encodeTgMem(pipe, &.{ buf_x, buf_gamma, buf_beta, buf_out, buf_xn, buf_rs },
+            @ptrCast(&LNFwdParams{ .d = @intCast(d), .eps = eps }), @sizeOf(LNFwdParams),
+            .{ .x = @intCast(d), .y = @intCast(seq) }, tg, d * @sizeOf(f32));
+        return .{ .out = buf_out, .x_norm = buf_xn, .rstd = buf_rs };
+    }
+
+    pub fn encodeRmsnormFwd(
+        eng: *MetalEngine, buf_x: GpuBuffer, buf_gamma: GpuBuffer,
+        eps: f32, seq: usize, d: usize, slot_base: u8,
+    ) NormResult {
+        const buf_out = eng.getScratch(f32, seq * d, slot_base);
+        const buf_xn = eng.getScratch(f32, seq * d, slot_base + 1);
+        const buf_rms = eng.getScratch(f32, seq, slot_base + 2);
+        const pipe = eng.getPipeline("rmsnorm_fwd_seq") catch @panic("pipeline");
+        const tg = Grid{ .x = @intCast(d), .y = 1 };
+        eng.encodeTgMem(pipe, &.{ buf_x, buf_gamma, buf_out, buf_xn, buf_rms },
+            @ptrCast(&RMSFwdParams{ .d = @intCast(d), .eps = eps }), @sizeOf(RMSFwdParams),
+            .{ .x = @intCast(d), .y = @intCast(seq) }, tg, d * @sizeOf(f32));
+        return .{ .out = buf_out, .x_norm = buf_xn, .rstd = buf_rms };
+    }
+
+    pub fn encodeFFNFwd(
+        eng: *MetalEngine, buf_input: GpuBuffer, buf_w: GpuBuffer, buf_b: GpuBuffer,
+        activation: Activation, n_in: usize, n_out: usize, seq: usize, slot_base: u8,
+    ) FFNResult {
+        const total = seq * n_out;
+        const buf_z = eng.getScratch(f32, total, slot_base);
+        const buf_za = eng.getScratch(f32, total, slot_base + 1);
+
+        // z = input × W^T
+        const bT_pipe = eng.getPipeline("matmul_bT_tiled_f32") catch @panic("pipeline");
+        const mp = MatmulParams{ .M = @intCast(seq), .K = @intCast(n_in), .N = @intCast(n_out) };
+        encodeTiledMatmul(eng, bT_pipe, &.{ buf_input, buf_w, buf_z }, mp, mp.M, mp.N);
+
+        // za = z + bias
+        const bias_pipe = eng.getPipeline("add_bias_batch_f32") catch @panic("pipeline");
+        eng.encodeTyped(bias_pipe, &.{ buf_z, buf_b, buf_za }, AddBiasBatchParams{
+            .seq = @intCast(seq), .n_out = @intCast(n_out),
+        }, .{ .x = @intCast(n_out), .y = @intCast(seq) }, null);
+
+        // activation
+        const act_kernel = activationKernelName(activation);
+        if (act_kernel) |name| {
+            const buf_act = eng.getScratch(f32, total, slot_base + 2);
+            const act_pipe = eng.getPipeline(name) catch @panic("pipeline");
+            eng.encodeTyped(act_pipe, &.{ buf_za, buf_act }, ElementwiseParams{
+                .length = @intCast(total),
+            }, .{ .x = @intCast(total) }, null);
+            return .{ .pre_act = buf_za, .output = buf_act };
+        }
+        return .{ .pre_act = buf_za, .output = buf_za };
+    }
+
+    pub fn encodeAttnFwd(
+        eng: *MetalEngine,
+        comptime d_model: usize, comptime n_heads: usize, comptime d_head: usize,
+        attn_scale: f32, seq: usize, causal: bool,
+        buf_x: GpuBuffer, buf_wq: GpuBuffer, buf_wk: GpuBuffer,
+        buf_wv: GpuBuffer, buf_wo: GpuBuffer,
+        slot_base: u8,
+    ) AttnFwdResult {
+        const smd = seq * d_model;
+        const shh = n_heads * seq * seq;
+
+        const buf_q = eng.getScratch(f32, smd, slot_base);
+        const buf_k = eng.getScratch(f32, smd, slot_base + 1);
+        const buf_v = eng.getScratch(f32, smd, slot_base + 2);
+        const buf_sc = eng.getScratch(f32, shh, slot_base + 3);
+        const buf_ctx = eng.getScratch(f32, smd, slot_base + 4);
+        const buf_out = eng.getScratch(f32, smd, slot_base + 5);
+
+        // Q, K, V projections
+        const bT = eng.getPipeline("matmul_bT_tiled_f32") catch @panic("pipeline");
+        const mp = MatmulParams{ .M = @intCast(seq), .K = @intCast(d_model), .N = @intCast(d_model) };
+        encodeTiledMatmul(eng, bT, &.{ buf_x, buf_wq, buf_q }, mp, mp.M, mp.N);
+        encodeTiledMatmul(eng, bT, &.{ buf_x, buf_wk, buf_k }, mp, mp.M, mp.N);
+        encodeTiledMatmul(eng, bT, &.{ buf_x, buf_wv, buf_v }, mp, mp.M, mp.N);
+
+        // attention scores
+        const sp = AttnScoreParams{
+            .seq = @intCast(seq), .n_heads = @intCast(n_heads),
+            .d_head = @intCast(d_head), .scale = attn_scale,
+            .causal = if (causal) 1 else 0,
+        };
+        const sc_pipe = eng.getPipeline("attn_scores_fwd") catch @panic("pipeline");
+        eng.encodeTyped(sc_pipe, &.{ buf_q, buf_k, buf_sc }, sp,
+            .{ .x = @intCast(seq), .y = @intCast(seq), .z = @intCast(n_heads) }, null);
+
+        // softmax
+        const sm_pipe = eng.getPipeline("softmax_rows_inplace") catch @panic("pipeline");
+        const n_rows: u32 = @intCast(n_heads * seq);
+        eng.encodeTgMem(sm_pipe, &.{buf_sc},
+            @ptrCast(&SoftmaxParams{ .n_rows = n_rows, .row_len = @intCast(seq) }),
+            @sizeOf(SoftmaxParams),
+            .{ .x = @intCast(seq), .y = n_rows }, .{ .x = @intCast(seq), .y = 1 }, seq * @sizeOf(f32));
+
+        // context
+        const ctx_pipe = eng.getPipeline("attn_context_fwd") catch @panic("pipeline");
+        const cp = AttnCtxParams{ .seq = @intCast(seq), .n_heads = @intCast(n_heads), .d_head = @intCast(d_head) };
+        eng.encodeTyped(ctx_pipe, &.{ buf_sc, buf_v, buf_ctx }, cp,
+            .{ .x = @intCast(d_head), .y = @intCast(seq), .z = @intCast(n_heads) }, null);
+
+        // output projection
+        encodeTiledMatmul(eng, bT, &.{ buf_ctx, buf_wo, buf_out }, mp, mp.M, mp.N);
+
+        return .{ .q = buf_q, .k = buf_k, .v = buf_v, .scores = buf_sc, .ctx = buf_ctx, .output = buf_out };
+    }
+
+    /// Encode: out[i] = a[i] + b[i]
+    pub fn encodeAdd(eng: *MetalEngine, buf_a: GpuBuffer, buf_b: GpuBuffer, len: usize, slot: u8) GpuBuffer {
+        const buf_out = eng.getScratch(f32, len, slot);
+        const pipe = eng.getPipeline("add_f32") catch @panic("pipeline");
+        eng.encodeTyped(pipe, &.{ buf_a, buf_b, buf_out }, ElementwiseParams{
+            .length = @intCast(len),
+        }, .{ .x = @intCast(len) }, null);
+        return buf_out;
+    }
+
+    // ── Backward encode-only helpers ──
+
+    pub fn encodeFFNBwd(
+        eng: *MetalEngine, buf_pre_act: GpuBuffer, buf_grad_out: GpuBuffer,
+        buf_input: GpuBuffer, buf_w: GpuBuffer, buf_gw: GpuBuffer, buf_gb: GpuBuffer,
+        activation: Activation, n_in: usize, n_out: usize, seq: usize, slot_base: u8,
+    ) struct { grad_in: GpuBuffer } {
+        const total = seq * n_out;
+
+        // delta = grad_out * act'(pre_act) — GPU
+        const buf_delta = eng.getScratch(f32, total, slot_base);
+        const act_bwd_pipe = eng.getPipeline("fused_act_backward") catch @panic("pipeline");
+        eng.encodeTyped(act_bwd_pipe, &.{ buf_pre_act, buf_grad_out, buf_delta }, ActBwdParams{
+            .length = @intCast(total), .act_type = activationTypeId(activation),
+        }, .{ .x = @intCast(total) }, null);
+
+        // grad_w += delta^T @ input
+        const bw_b_pipe = eng.getPipeline("matmul_backward_b_tiled") catch @panic("pipeline");
+        const mp = MatmulParams{ .M = @intCast(seq), .K = @intCast(n_out), .N = @intCast(n_in) };
+        encodeTiledMatmul(eng, bw_b_pipe, &.{ buf_delta, buf_input, buf_gw }, mp, mp.K, mp.N);
+
+        // grad_in = delta @ W
+        const buf_gi = eng.getScratch(f32, seq * n_in, slot_base + 1);
+        const mm_pipe = eng.getPipeline("matmul_tiled_f32") catch @panic("pipeline");
+        const mp_gi = MatmulParams{ .M = @intCast(seq), .K = @intCast(n_out), .N = @intCast(n_in) };
+        encodeTiledMatmul(eng, mm_pipe, &.{ buf_delta, buf_w, buf_gi }, mp_gi, mp_gi.M, mp_gi.N);
+
+        // grad_b += sum of delta over seq
+        const rb_pipe = eng.getPipeline("reduce_bias_grad") catch @panic("pipeline");
+        eng.encodeTyped(rb_pipe, &.{ buf_delta, buf_gb }, ReduceBiasParams{
+            .seq = @intCast(seq), .n_out = @intCast(n_out),
+        }, .{ .x = @intCast(n_out) }, null);
+
+        return .{ .grad_in = buf_gi };
+    }
+
+    pub fn encodeLayernormBwd(
+        eng: *MetalEngine, buf_go: GpuBuffer, buf_xn: GpuBuffer,
+        buf_gamma: GpuBuffer, buf_rstd: GpuBuffer,
+        buf_gg: GpuBuffer, buf_gb: GpuBuffer,
+        seq: usize, d: usize, slot: u8,
+    ) GpuBuffer {
+        const buf_gi = eng.getScratch(f32, seq * d, slot);
+        const pipe = eng.getPipeline("layernorm_bwd_seq") catch @panic("pipeline");
+        const tg = Grid{ .x = @intCast(d), .y = 1 };
+        eng.encodeTgMem(pipe, &.{ buf_go, buf_xn, buf_gamma, buf_rstd, buf_gg, buf_gb, buf_gi },
+            @ptrCast(&LNBwdParams{ .d = @intCast(d) }), @sizeOf(LNBwdParams),
+            .{ .x = @intCast(d), .y = @intCast(seq) }, tg, d * @sizeOf(f32));
+        return buf_gi;
+    }
+
+    pub fn encodeRmsnormBwd(
+        eng: *MetalEngine, buf_go: GpuBuffer, buf_xn: GpuBuffer,
+        buf_gamma: GpuBuffer, buf_rms: GpuBuffer, buf_gg: GpuBuffer,
+        seq: usize, d: usize, slot: u8,
+    ) GpuBuffer {
+        const buf_gi = eng.getScratch(f32, seq * d, slot);
+        const pipe = eng.getPipeline("rmsnorm_bwd_seq") catch @panic("pipeline");
+        const tg = Grid{ .x = @intCast(d), .y = 1 };
+        eng.encodeTgMem(pipe, &.{ buf_go, buf_xn, buf_gamma, buf_rms, buf_gg, buf_gi },
+            @ptrCast(&RMSBwdParams{ .d = @intCast(d) }), @sizeOf(RMSBwdParams),
+            .{ .x = @intCast(d), .y = @intCast(seq) }, tg, d * @sizeOf(f32));
+        return buf_gi;
+    }
+
+    pub fn encodeAttnBwd(
+        eng: *MetalEngine,
+        comptime d_model: usize, comptime n_heads: usize, comptime d_head: usize,
+        attn_scale: f32, seq: usize,
+        buf_x: GpuBuffer, buf_go: GpuBuffer,
+        buf_wq: GpuBuffer, buf_wk: GpuBuffer, buf_wv: GpuBuffer, buf_wo: GpuBuffer,
+        buf_cq: GpuBuffer, buf_ck: GpuBuffer, buf_cv: GpuBuffer, buf_ca: GpuBuffer, buf_cc: GpuBuffer,
+        buf_gwq: GpuBuffer, buf_gwk: GpuBuffer, buf_gwv: GpuBuffer, buf_gwo: GpuBuffer,
+        slot_base: u8,
+    ) GpuBuffer {
+        const smd = seq * d_model;
+        const shh = n_heads * seq * seq;
+        const dm32: u32 = @intCast(d_model);
+        const sq32: u32 = @intCast(seq);
+        const nh32: u32 = @intCast(n_heads);
+        const dh32: u32 = @intCast(d_head);
+
+        const buf_gq = eng.getScratch(f32, smd, slot_base);
+        const buf_gk = eng.getScratch(f32, smd, slot_base + 1);
+        const buf_gv = eng.getScratch(f32, smd, slot_base + 2);
+        const buf_gc = eng.getScratch(f32, smd, slot_base + 3);
+        const buf_gp = eng.getScratch(f32, shh, slot_base + 4);
+        const buf_gi_q = eng.getScratch(f32, smd, slot_base + 5);
+        const buf_gi_k = eng.getScratch(f32, smd, slot_base + 6);
+        const buf_gi_v = eng.getScratch(f32, smd, slot_base + 7);
+
+        // Zero accumulators
+        @memset(buf_gq.asSlice(f32)[0..smd], 0);
+        @memset(buf_gk.asSlice(f32)[0..smd], 0);
+        @memset(buf_gv.asSlice(f32)[0..smd], 0);
+
+        const mm = eng.getPipeline("matmul_tiled_f32") catch @panic("pipeline");
+        const bwB = eng.getPipeline("matmul_backward_b_tiled") catch @panic("pipeline");
+        const mp = MatmulParams{ .M = sq32, .K = dm32, .N = dm32 };
+
+        // Forward used concat @ Wo^T, so: grad_wo[m,n] = sum_t(grad_out[t,m] * concat[t,n])
+        // => A=grad_out, grad_c=concat (swapped from naive A @ B formula)
+        encodeTiledMatmul(eng, bwB, &.{ buf_go, buf_cc, buf_gwo }, mp, mp.K, mp.N);
+        // Forward used concat @ Wo^T, so grad_concat = grad_out @ Wo (not Wo^T)
+        encodeTiledMatmul(eng, mm, &.{ buf_go, buf_wo, buf_gc }, mp, mp.M, mp.N);
+
+        const ctx_p = AttnCtxParams{ .seq = sq32, .n_heads = nh32, .d_head = dh32 };
+
+        // grad_v
+        const gv_pipe = eng.getPipeline("attn_grad_v") catch @panic("pipeline");
+        eng.encodeTyped(gv_pipe, &.{ buf_ca, buf_gc, buf_gv }, ctx_p,
+            .{ .x = dh32, .y = sq32, .z = nh32 }, null);
+
+        // grad_attn_pre
+        const gp_pipe = eng.getPipeline("attn_grad_attn_pre") catch @panic("pipeline");
+        eng.encodeTyped(gp_pipe, &.{ buf_gc, buf_cv, buf_gp }, ctx_p,
+            .{ .x = sq32, .y = sq32, .z = nh32 }, null);
+
+        // softmax backward
+        const n_rows: u32 = nh32 * sq32;
+        const sb_pipe = eng.getPipeline("softmax_bwd_rows") catch @panic("pipeline");
+        eng.encodeTgMem(sb_pipe, &.{ buf_ca, buf_gp },
+            @ptrCast(&SoftmaxBwdParams{ .n_rows = n_rows, .row_len = sq32 }),
+            @sizeOf(SoftmaxBwdParams),
+            .{ .x = sq32, .y = n_rows }, .{ .x = sq32, .y = 1 }, seq * @sizeOf(f32));
+
+        // grad_q, grad_k
+        const qk_p = AttnGradQKParams{ .seq = sq32, .n_heads = nh32, .d_head = dh32, .scale = attn_scale };
+        const gq_pipe = eng.getPipeline("attn_grad_q") catch @panic("pipeline");
+        eng.encodeTyped(gq_pipe, &.{ buf_gp, buf_ck, buf_gq }, qk_p,
+            .{ .x = dh32, .y = sq32, .z = nh32 }, null);
+        const gk_pipe = eng.getPipeline("attn_grad_k") catch @panic("pipeline");
+        eng.encodeTyped(gk_pipe, &.{ buf_gp, buf_cq, buf_gk }, qk_p,
+            .{ .x = dh32, .y = sq32, .z = nh32 }, null);
+
+        // Forward used X @ W^T, so: grad_w[m,n] = sum_t(grad[t,m] * X[t,n]) => A=grad, grad_c=X
+        // grad_in = grad @ W (not W^T) since forward was X @ W^T
+        encodeTiledMatmul(eng, bwB, &.{ buf_gq, buf_x, buf_gwq }, mp, mp.K, mp.N);
+        encodeTiledMatmul(eng, mm, &.{ buf_gq, buf_wq, buf_gi_q }, mp, mp.M, mp.N);
+        encodeTiledMatmul(eng, bwB, &.{ buf_gk, buf_x, buf_gwk }, mp, mp.K, mp.N);
+        encodeTiledMatmul(eng, mm, &.{ buf_gk, buf_wk, buf_gi_k }, mp, mp.M, mp.N);
+        encodeTiledMatmul(eng, bwB, &.{ buf_gv, buf_x, buf_gwv }, mp, mp.K, mp.N);
+        encodeTiledMatmul(eng, mm, &.{ buf_gv, buf_wv, buf_gi_v }, mp, mp.M, mp.N);
+
+        // Sum three grad_in contributions on GPU
+        const buf_gi = eng.getScratch(f32, smd, slot_base + 8);
+        const add3_pipe = eng.getPipeline("add3_f32") catch @panic("pipeline");
+        eng.encodeTyped(add3_pipe, &.{ buf_gi_q, buf_gi_k, buf_gi_v, buf_gi }, ElementwiseParams{
+            .length = @intCast(smd),
+        }, .{ .x = @intCast(smd) }, null);
+
+        return buf_gi;
     }
 };

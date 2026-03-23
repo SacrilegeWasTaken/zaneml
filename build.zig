@@ -23,6 +23,7 @@ pub fn build(b: *std.Build) void {
     const transformer_exe = addExample(b, "transformer", "examples/transformer.zig", target, optimize, example_imports);
     const autograd_exe = addExample(b, "autograd", "examples/autograd.zig", target, optimize, example_imports);
     const big_transformer_exe = addExample(b, "big-transformer", "examples/big_transformer.zig", target, optimize, example_imports);
+    const grad_check_exe = addExample(b, "grad-check", "examples/grad_check.zig", target, optimize, example_imports);
 
     b.installArtifact(main_exe);
 
@@ -32,6 +33,7 @@ pub fn build(b: *std.Build) void {
     addRunStep(b, transformer_exe, "transformer", "Run examples/transformer.zig");
     addRunStep(b, autograd_exe, "autograd", "Run examples/autograd.zig (XOR via Tape API)");
     addRunStep(b, big_transformer_exe, "big-transformer", "Run examples/big_transformer.zig (Metal benchmark)");
+    addRunStep(b, grad_check_exe, "grad-check", "Run gradient checker (finite differences)");
 
     // ── Tests ────────────────────────────────────────────────────────────────
 

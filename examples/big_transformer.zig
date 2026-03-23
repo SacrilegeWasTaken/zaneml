@@ -8,13 +8,13 @@
 const std    = @import("std");
 const zaneml = @import("zaneml");
 
-const BACKEND  = .cpu;
-const D_MODEL  = 128;
+const BACKEND  = .metal;
+const D_MODEL  = 256;
 const N_HEADS  = 4;
-const D_FF     = 512;
-const MAX_SEQ  = 16;
+const D_FF     = 1024;
+const MAX_SEQ  = 4;
 const N_LAYERS = 4;
-const SEQ_LEN  = 8;
+const SEQ_LEN  = 2;
 
 const Stack = zaneml.TransformerStack(BACKEND, D_MODEL, N_HEADS, D_FF, MAX_SEQ, N_LAYERS, .{
     .norm = .layer_norm,

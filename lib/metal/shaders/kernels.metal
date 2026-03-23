@@ -93,6 +93,212 @@ kernel void matmul_backward_b(
     grad_b[row * p.N + col] += sum;
 }
 
+// ─── TILED MATMUL (16×16 tiles with threadgroup memory) 
+// ~16x fewer global memory reads than naive kernels via data reuse in shared memory.
+
+constant uint TILE = 16;
+
+// C[M×N] = A[M×K] × B[K×N]  (overwrite)
+kernel void matmul_tiled_f32(
+    device const float* A      [[buffer(0)]],
+    device const float* B      [[buffer(1)]],
+    device       float* C      [[buffer(2)]],
+    constant MatmulParams& p   [[buffer(3)]],
+    uint2 gid                  [[thread_position_in_grid]],
+    uint2 lid                  [[thread_position_in_threadgroup]],
+    uint2 tgid                 [[threadgroup_position_in_grid]],
+    threadgroup float* sh      [[threadgroup(0)]]
+) {
+    threadgroup float* tA = sh;
+    threadgroup float* tB = sh + TILE * TILE;
+    uint row = tgid.y * TILE + lid.y;
+    uint col = tgid.x * TILE + lid.x;
+    float sum = 0.0f;
+    uint num_tiles = (p.K + TILE - 1) / TILE;
+    for (uint t = 0; t < num_tiles; t++) {
+        uint a_col = t * TILE + lid.x;
+        uint b_row = t * TILE + lid.y;
+        tA[lid.y * TILE + lid.x] = (row < p.M && a_col < p.K) ? A[row * p.K + a_col] : 0.0f;
+        tB[lid.y * TILE + lid.x] = (b_row < p.K && col < p.N) ? B[b_row * p.N + col] : 0.0f;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint k = 0; k < TILE; k++)
+            sum += tA[lid.y * TILE + k] * tB[k * TILE + lid.x];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (row < p.M && col < p.N)
+        C[row * p.N + col] = sum;
+}
+
+// C[M×N] = A[M×K] × B^T[N×K]  (B stored transposed as [N×K])  (overwrite)
+kernel void matmul_bT_tiled_f32(
+    device const float* A      [[buffer(0)]],
+    device const float* BT     [[buffer(1)]],
+    device       float* C      [[buffer(2)]],
+    constant MatmulParams& p   [[buffer(3)]],
+    uint2 gid                  [[thread_position_in_grid]],
+    uint2 lid                  [[thread_position_in_threadgroup]],
+    uint2 tgid                 [[threadgroup_position_in_grid]],
+    threadgroup float* sh      [[threadgroup(0)]]
+) {
+    threadgroup float* tA = sh;
+    threadgroup float* tB = sh + TILE * TILE;
+    uint row = tgid.y * TILE + lid.y;
+    uint col = tgid.x * TILE + lid.x;
+    float sum = 0.0f;
+    uint num_tiles = (p.K + TILE - 1) / TILE;
+    for (uint t = 0; t < num_tiles; t++) {
+        uint a_col = t * TILE + lid.x;
+        uint b_k   = t * TILE + lid.y;  // k index into BT
+        tA[lid.y * TILE + lid.x] = (row < p.M && a_col < p.K) ? A[row * p.K + a_col] : 0.0f;
+        // BT is [N×K], logical B[k, col] = BT[col * K + k]
+        tB[lid.y * TILE + lid.x] = (b_k < p.K && col < p.N) ? BT[col * p.K + b_k] : 0.0f;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint k = 0; k < TILE; k++)
+            sum += tA[lid.y * TILE + k] * tB[k * TILE + lid.x];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (row < p.M && col < p.N)
+        C[row * p.N + col] = sum;
+}
+
+// dA[M×K] += dC[M×N] × B^T  (accumulate)
+// dA[row,col] = sum_n dC[row,n] * B[col,n]  (B is K×N, accessing row col of B)
+kernel void matmul_backward_a_tiled(
+    device const float* grad_c  [[buffer(0)]],
+    device const float* B       [[buffer(1)]],
+    device       float* grad_a  [[buffer(2)]],
+    constant MatmulParams& p    [[buffer(3)]],
+    uint2 gid                   [[thread_position_in_grid]],
+    uint2 lid                   [[thread_position_in_threadgroup]],
+    uint2 tgid                  [[threadgroup_position_in_grid]],
+    threadgroup float* sh       [[threadgroup(0)]]
+) {
+    // Treating this as C[M×K] = dC[M×N] × B_logical^T[N×K]
+    // where B_logical^T[n, k] = B[k, n] = B[k * N + n]
+    // So: A_mat = grad_c[M×N], B_mat stored as B[K×N] but we need B^T[N×K]
+    threadgroup float* tA = sh;
+    threadgroup float* tB = sh + TILE * TILE;
+    uint row = tgid.y * TILE + lid.y;  // M dim
+    uint col = tgid.x * TILE + lid.x;  // K dim
+    float sum = 0.0f;
+    uint num_tiles = (p.N + TILE - 1) / TILE;  // reduce over N
+    for (uint t = 0; t < num_tiles; t++) {
+        uint a_col = t * TILE + lid.x;  // N index
+        uint b_row = t * TILE + lid.y;  // N index
+        tA[lid.y * TILE + lid.x] = (row < p.M && a_col < p.N) ? grad_c[row * p.N + a_col] : 0.0f;
+        // B^T[n, k] = B[k * N + n], k=col, n=b_row
+        tB[lid.y * TILE + lid.x] = (b_row < p.N && col < p.K) ? B[col * p.N + b_row] : 0.0f;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint k = 0; k < TILE; k++)
+            sum += tA[lid.y * TILE + k] * tB[k * TILE + lid.x];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (row < p.M && col < p.K)
+        grad_a[row * p.K + col] += sum;
+}
+
+// dB[K×N] += A^T[K×M] × dC[M×N]  (accumulate)
+kernel void matmul_backward_b_tiled(
+    device const float* A       [[buffer(0)]],
+    device const float* grad_c  [[buffer(1)]],
+    device       float* grad_b  [[buffer(2)]],
+    constant MatmulParams& p    [[buffer(3)]],
+    uint2 gid                   [[thread_position_in_grid]],
+    uint2 lid                   [[thread_position_in_threadgroup]],
+    uint2 tgid                  [[threadgroup_position_in_grid]],
+    threadgroup float* sh       [[threadgroup(0)]]
+) {
+    // Output: dB[row=k, col=n], reduce over M
+    // A^T[k, m] = A[m * K + k]
+    threadgroup float* tA = sh;
+    threadgroup float* tB = sh + TILE * TILE;
+    uint row = tgid.y * TILE + lid.y;  // K dim
+    uint col = tgid.x * TILE + lid.x;  // N dim
+    float sum = 0.0f;
+    uint num_tiles = (p.M + TILE - 1) / TILE;  // reduce over M
+    for (uint t = 0; t < num_tiles; t++) {
+        uint m_a = t * TILE + lid.x;  // M index for A^T column
+        uint m_b = t * TILE + lid.y;  // M index for dC row
+        // A^T[row, m_a] = A[m_a * K + row]
+        tA[lid.y * TILE + lid.x] = (m_a < p.M && row < p.K) ? A[m_a * p.K + row] : 0.0f;
+        tB[lid.y * TILE + lid.x] = (m_b < p.M && col < p.N) ? grad_c[m_b * p.N + col] : 0.0f;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint k = 0; k < TILE; k++)
+            sum += tA[lid.y * TILE + k] * tB[k * TILE + lid.x];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (row < p.K && col < p.N)
+        grad_b[row * p.N + col] += sum;
+}
+
+// ─── UTILITY KERNELS 
+
+// Element-wise sum of 3 vectors: out[i] = a[i] + b[i] + c[i]
+kernel void add3_f32(
+    device const float* a       [[buffer(0)]],
+    device const float* b       [[buffer(1)]],
+    device const float* c       [[buffer(2)]],
+    device       float* out     [[buffer(3)]],
+    constant ElementwiseParams& p [[buffer(4)]],
+    uint gid                    [[thread_position_in_grid]]
+) {
+    if (gid >= p.length) return;
+    out[gid] = a[gid] + b[gid] + c[gid];
+}
+
+// Fused activation backward: out[i] = grad_out[i] * act'(pre_act[i])
+struct ActBwdParams { uint length; uint act_type; };
+// act_type: 0=linear, 1=relu, 2=sigmoid, 3=tanh, 4=silu, 5=gelu
+
+kernel void fused_act_backward(
+    device const float* pre_act  [[buffer(0)]],
+    device const float* grad_out [[buffer(1)]],
+    device       float* delta    [[buffer(2)]],
+    constant ActBwdParams& p     [[buffer(3)]],
+    uint gid                     [[thread_position_in_grid]]
+) {
+    if (gid >= p.length) return;
+    float go = grad_out[gid];
+    float x  = pre_act[gid];
+    float d;
+    switch (p.act_type) {
+        case 0: d = go; break;  // linear
+        case 1: d = (x > 0.0f) ? go : 0.0f; break;  // relu
+        case 2: { float s = 1.0f / (1.0f + exp(-x)); d = go * s * (1.0f - s); break; }  // sigmoid
+        case 3: { float t = tanh(x); d = go * (1.0f - t * t); break; }  // tanh
+        case 4: { float s = 1.0f / (1.0f + exp(-x)); d = go * s * (1.0f + x * (1.0f - s)); break; }  // silu
+        case 5: {  // gelu
+            float cc = 0.7978845608f;
+            float x3 = x * x * x;
+            float inner = cc * (x + 0.044715f * x3);
+            float th = tanh(inner);
+            float dtanh = 1.0f - th * th;
+            float dinner = cc * (1.0f + 3.0f * 0.044715f * x * x);
+            d = go * (0.5f * (1.0f + th) + 0.5f * x * dtanh * dinner);
+            break;
+        }
+        default: d = go; break;
+    }
+    delta[gid] = d;
+}
+
+// Reduce bias gradient: grad_b[i] += sum over seq of delta[t * n_out + i]
+// Grid: (n_out), each thread sums over seq positions for one neuron
+struct ReduceBiasParams { uint seq; uint n_out; };
+
+kernel void reduce_bias_grad(
+    device const float* delta    [[buffer(0)]],  // [seq × n_out]
+    device       float* grad_b   [[buffer(1)]],  // [n_out]  (accumulated)
+    constant ReduceBiasParams& p [[buffer(2)]],
+    uint gid                     [[thread_position_in_grid]]
+) {
+    if (gid >= p.n_out) return;
+    float sum = 0.0f;
+    for (uint t = 0; t < p.seq; t++)
+        sum += delta[t * p.n_out + gid];
+    grad_b[gid] += sum;
+}
+
 // ELEMENTWISE OPERATIONS
 
 kernel void relu_forward(
@@ -367,7 +573,7 @@ kernel void reduce_sum(
     }
 }
 
-// ─── LAYER NORM (batch, power-of-2 d_model) ──────────────────────────────
+// ─── LAYER NORM (batch, power-of-2 d_model) 
 // forward: one threadgroup per token position, d threads per group (d = d_model)
 // Single params struct at buffer(6): { uint d; float eps; }
 
@@ -475,7 +681,7 @@ kernel void layernorm_bwd_seq(
     }
 }
 
-// ─── RMS NORM (batch) ────────────────────────────────────────────────────
+// ─── RMS NORM (batch) 
 // 5 data buffers (0-4), params struct { uint d; float eps } at buffer(5)
 kernel void rmsnorm_fwd_seq(
     device const float* x        [[buffer(0)]],
@@ -547,7 +753,7 @@ kernel void rmsnorm_bwd_seq(
     }
 }
 
-// ─── POSITIONAL EMBEDDING ────────────────────────────────────────────────
+// ─── POSITIONAL EMBEDDING 
 kernel void pe_fwd(
     device const float* input  [[buffer(0)]],  // [len]
     device const float* embed  [[buffer(1)]],  // [len]
@@ -570,7 +776,7 @@ kernel void pe_bwd_embed(
     atomic_fetch_add_explicit(&grad_embed[gid], grad_out[gid], memory_order_relaxed);
 }
 
-// ─── ATTENTION ───────────────────────────────────────────────────────────
+// ─── ATTENTION 
 
 struct AttnScoreParams {
     uint  seq;
@@ -665,7 +871,7 @@ kernel void attn_context_fwd(
     ctx[i * dm + ho + dk] = s;
 }
 
-// ─── ATTENTION BACKWARD ──────────────────────────────────────────────────
+// ─── ATTENTION BACKWARD 
 
 // grad_v[j, h*d_head+dk] += sum_i(attn[h,i,j] * grad_ctx[i, h*d_head+dk])
 // Grid: (d_head, seq, n_heads)
@@ -791,7 +997,7 @@ kernel void attn_grad_k(
     atomic_fetch_add_explicit(&grad_k[j * dm + ho + dk], s * p.scale, memory_order_relaxed);
 }
 
-// ── Embedding ─────────────────────────────────────────────────────────────
+// ── Embedding 
 
 struct EmbedParams { uint d_model; };
 
@@ -826,7 +1032,7 @@ kernel void embedding_bwd(
         memory_order_relaxed);
 }
 
-// ── Dropout ───────────────────────────────────────────────────────────────
+// ── Dropout 
 
 struct DropoutFwdParams { uint length; float scale; uint training; };
 
@@ -855,7 +1061,7 @@ kernel void dropout_bwd(
     grad_in[gid] = mask[gid] ? grad_out[gid] * p.scale : 0.0f;
 }
 
-// ── Loss ──────────────────────────────────────────────────────────────────
+// ── Loss 
 //
 // Both loss kernels run as a SINGLE threadgroup whose size is the next
 // power-of-2 >= length.  Threads with lid >= length contribute 0 / identity.
