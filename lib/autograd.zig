@@ -358,6 +358,265 @@ pub fn Tape(comptime backend: Backend) type {
             return out;
         }
 
+        /// out[i] = a[i] * s  (scalar multiply)
+        pub fn scale(self: *Self, a: *Tensor, s: f32) !*Tensor {
+            const out = try self.newTensor(a.data.len, a.requires_grad);
+            for (out.data, a.data) |*o, av| o.* = av * s;
+
+            if (a.requires_grad) {
+                const Ctx = struct { a: *Tensor, out: *Tensor, s: f32 };
+                const ctx = try self.arena.allocator().create(Ctx);
+                ctx.* = .{ .a = a, .out = out, .s = s };
+                try self.recordOp(Ctx, ctx, struct {
+                    fn bwd(ptr: *anyopaque) void {
+                        const c: *Ctx = @ptrCast(@alignCast(ptr));
+                        for (c.a.grad, c.out.grad) |*ag, og| ag.* += og * c.s;
+                    }
+                }.bwd);
+            }
+            return out;
+        }
+
+        /// out = a - b  (element-wise)
+        pub fn sub(self: *Self, a: *Tensor, b: *Tensor) !*Tensor {
+            std.debug.assert(a.data.len == b.data.len);
+            const rg  = a.requires_grad or b.requires_grad;
+            const out = try self.newTensor(a.data.len, rg);
+            for (out.data, a.data, b.data) |*o, av, bv| o.* = av - bv;
+
+            if (rg) {
+                const Ctx = struct { a: *Tensor, b: *Tensor, out: *Tensor };
+                const ctx = try self.arena.allocator().create(Ctx);
+                ctx.* = .{ .a = a, .b = b, .out = out };
+                try self.recordOp(Ctx, ctx, struct {
+                    fn bwd(ptr: *anyopaque) void {
+                        const c: *Ctx = @ptrCast(@alignCast(ptr));
+                        if (c.a.requires_grad) {
+                            for (c.a.grad, c.out.grad) |*ag, og| ag.* += og;
+                        }
+                        if (c.b.requires_grad) {
+                            for (c.b.grad, c.out.grad) |*bg, og| bg.* -= og;
+                        }
+                    }
+                }.bwd);
+            }
+            return out;
+        }
+
+        /// out[row, col] = x[row, col] + bias[col]  (broadcast bias across rows)
+        pub fn addBias(self: *Self, x: *Tensor, bias: *Tensor, n_rows: usize, n_cols: usize) !*Tensor {
+            std.debug.assert(n_rows >= 1);
+            std.debug.assert(n_cols >= 1);
+            std.debug.assert(x.data.len == n_rows * n_cols);
+            std.debug.assert(bias.data.len == n_cols);
+            const rg  = x.requires_grad or bias.requires_grad;
+            const out = try self.newTensor(x.data.len, rg);
+            for (0..n_rows) |r| {
+                const row_x   = x.data[r * n_cols ..][0..n_cols];
+                const row_out = out.data[r * n_cols ..][0..n_cols];
+                for (row_out, row_x, bias.data) |*o, xv, bv| o.* = xv + bv;
+            }
+
+            if (rg) {
+                const Ctx = struct { x: *Tensor, bias: *Tensor, out: *Tensor, n_rows: usize, n_cols: usize };
+                const ctx = try self.arena.allocator().create(Ctx);
+                ctx.* = .{ .x = x, .bias = bias, .out = out, .n_rows = n_rows, .n_cols = n_cols };
+                try self.recordOp(Ctx, ctx, struct {
+                    fn bwd(ptr: *anyopaque) void {
+                        const c: *Ctx = @ptrCast(@alignCast(ptr));
+                        for (0..c.n_rows) |r| {
+                            const og = c.out.grad[r * c.n_cols ..][0..c.n_cols];
+                            if (c.x.requires_grad) {
+                                for (c.x.grad[r * c.n_cols ..][0..c.n_cols], og) |*xg, o| xg.* += o;
+                            }
+                            if (c.bias.requires_grad) {
+                                for (c.bias.grad, og) |*bg, o| bg.* += o;
+                            }
+                        }
+                    }
+                }.bwd);
+            }
+            return out;
+        }
+
+        /// Row-wise softmax: out[row] = softmax(a[row])
+        pub fn softmax(self: *Self, a: *Tensor, n_rows: usize, n_cols: usize) !*Tensor {
+            std.debug.assert(n_rows >= 1);
+            std.debug.assert(n_cols >= 1);
+            std.debug.assert(a.data.len == n_rows * n_cols);
+            const out = try self.newTensor(a.data.len, a.requires_grad);
+            for (0..n_rows) |r| {
+                const row_in  = a.data[r * n_cols ..][0..n_cols];
+                const row_out = out.data[r * n_cols ..][0..n_cols];
+                var max_v = row_in[0];
+                for (row_in) |v| if (v > max_v) { max_v = v; };
+                var sum: f32 = 0;
+                for (row_in) |v| sum += @exp(v - max_v);
+                for (row_out, row_in) |*o, v| o.* = @exp(v - max_v) / sum;
+            }
+
+            if (a.requires_grad) {
+                const Ctx = struct { a: *Tensor, out: *Tensor, n_rows: usize, n_cols: usize };
+                const ctx = try self.arena.allocator().create(Ctx);
+                ctx.* = .{ .a = a, .out = out, .n_rows = n_rows, .n_cols = n_cols };
+                try self.recordOp(Ctx, ctx, struct {
+                    fn bwd(ptr: *anyopaque) void {
+                        const c: *Ctx = @ptrCast(@alignCast(ptr));
+                        // dx_i = y_i * (dy_i - dot(dy, y))
+                        for (0..c.n_rows) |r| {
+                            const y  = c.out.data[r * c.n_cols ..][0..c.n_cols];
+                            const dy = c.out.grad[r * c.n_cols ..][0..c.n_cols];
+                            const dx = c.a.grad[r * c.n_cols ..][0..c.n_cols];
+                            var dot: f32 = 0;
+                            for (y, dy) |yv, dv| dot += yv * dv;
+                            for (dx, y, dy) |*dxi, yi, dyi| dxi.* += yi * (dyi - dot);
+                        }
+                    }
+                }.bwd);
+            }
+            return out;
+        }
+
+        /// Layer normalization: out[row] = gamma * (x[row] - mean) / std + beta
+        /// gamma, beta — *Tensor with n_cols elements (learnable scale/shift).
+        pub fn layernorm(self: *Self, x: *Tensor, gamma: *Tensor, beta: *Tensor,
+                         n_rows: usize, n_cols: usize, eps: f32) !*Tensor {
+            std.debug.assert(n_rows >= 1);
+            std.debug.assert(n_cols >= 1);
+            std.debug.assert(x.data.len     == n_rows * n_cols);
+            std.debug.assert(gamma.data.len == n_cols);
+            std.debug.assert(beta.data.len  == n_cols);
+            const rg    = x.requires_grad or gamma.requires_grad or beta.requires_grad;
+            const out   = try self.newTensor(n_rows * n_cols, rg);
+            // x_hat and rstd_buf are arena-owned intermediates needed in the backward.
+            const x_hat  = try self.newTensor(n_rows * n_cols, false);
+            const rstd_b = try self.newTensor(n_rows, false);
+
+            const nf: f32 = @floatFromInt(n_cols);
+            for (0..n_rows) |r| {
+                const row_x   = x.data[r * n_cols ..][0..n_cols];
+                const row_xh  = x_hat.data[r * n_cols ..][0..n_cols];
+                const row_out = out.data[r * n_cols ..][0..n_cols];
+
+                var mu: f32 = 0;
+                for (row_x) |v| mu += v;
+                mu /= nf;
+
+                var variance: f32 = 0;
+                for (row_x) |v| { const d = v - mu; variance += d * d; }
+                variance /= nf;
+
+                const rstd = 1.0 / @sqrt(variance + eps);
+                rstd_b.data[r] = rstd;
+
+                for (row_xh, row_x) |*xh, xv| xh.* = (xv - mu) * rstd;
+                for (row_out, row_xh, gamma.data, beta.data) |*o, xh, g, b| o.* = g * xh + b;
+            }
+
+            if (rg) {
+                const Ctx = struct {
+                    x: *Tensor, gamma: *Tensor, beta: *Tensor, out: *Tensor,
+                    x_hat: *Tensor, rstd_b: *Tensor,
+                    n_rows: usize, n_cols: usize,
+                };
+                const ctx = try self.arena.allocator().create(Ctx);
+                ctx.* = .{ .x = x, .gamma = gamma, .beta = beta, .out = out,
+                            .x_hat = x_hat, .rstd_b = rstd_b,
+                            .n_rows = n_rows, .n_cols = n_cols };
+                try self.recordOp(Ctx, ctx, struct {
+                    fn bwd(ptr: *anyopaque) void {
+                        const c: *Ctx = @ptrCast(@alignCast(ptr));
+                        const n: f32 = @floatFromInt(c.n_cols);
+                        for (0..c.n_rows) |r| {
+                            const og   = c.out.grad[r * c.n_cols ..][0..c.n_cols];
+                            const xh   = c.x_hat.data[r * c.n_cols ..][0..c.n_cols];
+                            const rstd = c.rstd_b.data[r];
+
+                            if (c.gamma.requires_grad) {
+                                for (c.gamma.grad, og, xh) |*gg, o, xhv| gg.* += o * xhv;
+                            }
+                            if (c.beta.requires_grad) {
+                                for (c.beta.grad, og) |*bg, o| bg.* += o;
+                            }
+                            if (c.x.requires_grad) {
+                                // Standard layernorm backward:
+                                // dx_i = (dxh_i - sum(dxh)/n - xh_i*sum(dxh*xh)/n) * rstd
+                                const xg = c.x.grad[r * c.n_cols ..][0..c.n_cols];
+                                var sum_dxh: f32    = 0;
+                                var sum_dxh_xh: f32 = 0;
+                                for (og, xh, c.gamma.data) |o, xhv, gv| {
+                                    const dxh = o * gv;
+                                    sum_dxh    += dxh;
+                                    sum_dxh_xh += dxh * xhv;
+                                }
+                                for (xg, og, xh, c.gamma.data) |*xi, o, xhv, gv| {
+                                    xi.* += (o * gv - sum_dxh / n - xhv * sum_dxh_xh / n) * rstd;
+                                }
+                            }
+                        }
+                    }
+                }.bwd);
+            }
+            return out;
+        }
+
+        /// Create a no-grad arena tensor wrapping a copy of data.
+        /// Freed automatically on tape.reset(). Useful for passing external data into applyModule.
+        pub fn inputFrom(self: *Self, data: []const f32) !*Tensor {
+            const t = try self.newTensor(data.len, false);
+            @memcpy(t.data, data);
+            return t;
+        }
+
+        /// Wrap any module as a single tape op.
+        ///
+        /// module must be a pointer to a type with:
+        ///   forward (self, input: []const f32,      output:   []f32)       void
+        ///   backward(self, input: []const f32,      grad_out: []const f32,
+        ///                  grad_in: []f32)                                [!]void
+        ///
+        /// Sizes in backward: input.data.len, out_size, input.data.len (grad_in == input).
+        /// out_size may differ from input.data.len (e.g. projection layers).
+        ///
+        /// The backward is always recorded (even when input.requires_grad=false)
+        /// so the module's internal parameters accumulate gradients normally.
+        ///
+        /// The module pointer must outlive the tape (i.e. until tape.reset() is called).
+        pub fn applyModule(self: *Self, module: anytype, input: *Tensor, out_size: usize) !*Tensor {
+            const M   = @TypeOf(module);
+            const out = try self.newTensor(out_size, true);
+            module.forward(input.data, out.data);
+
+            const Ctx = struct { m: M, input: *Tensor, out: *Tensor, tmp: []f32 };
+            const alloc = self.arena.allocator();
+            const ctx   = try alloc.create(Ctx);
+            ctx.* = .{
+                .m     = module,
+                .input = input,
+                .out   = out,
+                .tmp   = try alloc.alloc(f32, input.data.len),
+            };
+            @memset(ctx.tmp, 0);
+            try self.recordOp(Ctx, ctx, struct {
+                fn bwd(ptr: *anyopaque) void {
+                    const c: *Ctx = @ptrCast(@alignCast(ptr));
+                    @memset(c.tmp, 0);
+                    const Base = @typeInfo(M).pointer.child;
+                    const ret  = @typeInfo(@TypeOf(Base.backward)).@"fn".return_type.?;
+                    if (comptime @typeInfo(ret) == .error_union) {
+                        c.m.backward(c.input.data, c.out.grad, c.tmp) catch @panic("applyModule backward failed");
+                    } else {
+                        c.m.backward(c.input.data, c.out.grad, c.tmp);
+                    }
+                    if (c.input.requires_grad) {
+                        for (c.input.grad, c.tmp) |*ig, tg| ig.* += tg;
+                    }
+                }
+            }.bwd);
+
+            return out;
+        }
+
         /// Scalar cross-entropy loss with softmax: out[0] = -sum(target * log(softmax(pred)))
         pub fn crossEntropy(self: *Self, pred: *Tensor, target: []const f32) !*Tensor {
             std.debug.assert(pred.data.len == target.len);

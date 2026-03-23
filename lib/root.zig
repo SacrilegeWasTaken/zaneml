@@ -39,6 +39,9 @@ pub const AutogradTensor = @import("autograd.zig").Tensor;
 /// Two-layer MLP trained via tape-based autograd (plug-in for Network)
 pub const TapeMLP = @import("tape_mlp.zig").TapeMLP;
 
+/// TransformerStack wrapped as a tape-compatible module (same GPU perf, autograd composable)
+pub const TapeTransformerStack = @import("tape_transformer.zig").TapeTransformerStack;
+
 /// Backend optimizer dispatch — use in custom models that implement updateWeights.
 pub const OptimizerImpl = @import("backend.zig").OptimizerImpl;
 
