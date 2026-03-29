@@ -15,8 +15,10 @@
 </p>
 
 ---
-**NOTE!** This library will evolving slowly until zig 1.0
----
+
+<p align="center">
+  NOTE! This library will evolve slowly until zig 1.0
+</p>
 
 ## Features
 
