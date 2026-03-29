@@ -15,6 +15,8 @@
 </p>
 
 ---
+**NOTE!** This library will evolving slowly until zig 1.0
+---
 
 ## Features
 
